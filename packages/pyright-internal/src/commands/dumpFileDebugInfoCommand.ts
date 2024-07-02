@@ -26,11 +26,11 @@ import {
 } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { isNumber, isString } from '../common/core';
+import { LanguageServerInterface } from '../common/languageServerInterface';
 import { convertOffsetToPosition, convertOffsetsToRange } from '../common/positionUtils';
 import { TextRange } from '../common/textRange';
 import { TextRangeCollection } from '../common/textRangeCollection';
 import { Uri } from '../common/uri/uri';
-import { LanguageServerInterface } from '../languageServerBase';
 import {
     ArgumentCategory,
     ArgumentNode,
@@ -44,6 +44,9 @@ import {
     CallNode,
     CaseNode,
     ClassNode,
+    ComprehensionForNode,
+    ComprehensionIfNode,
+    ComprehensionNode,
     ConstantNode,
     ContinueNode,
     DecoratorNode,
@@ -68,9 +71,6 @@ import {
     ImportNode,
     IndexNode,
     LambdaNode,
-    ListComprehensionForNode,
-    ListComprehensionIfNode,
-    ListComprehensionNode,
     ListNode,
     MatchNode,
     MemberAccessNode,
@@ -119,8 +119,9 @@ import {
     YieldNode,
     isExpressionNode,
 } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { KeywordType, NewLineType, OperatorType, StringTokenFlags, Token, TokenType } from '../parser/tokenizerTypes';
+import { Workspace } from '../workspaceFactory';
 import { ServerCommand } from './commandController';
 
 export class DumpFileDebugInfoCommand implements ServerCommand {
@@ -133,100 +134,112 @@ export class DumpFileDebugInfoCommand implements ServerCommand {
             return [];
         }
 
-        const fileUri = Uri.parse(params.arguments[0] as string, this._ls.rootUri.isCaseSensitive);
-        const kind = params.arguments[1];
-
+        const fileUri = Uri.parse(params.arguments[0] as string, this._ls.serviceProvider);
         const workspace = await this._ls.getWorkspaceForFile(fileUri);
-        const parseResults = workspace.service.getParseResult(workspace.service.fs.realCasePath(fileUri));
-        if (!parseResults) {
-            return [];
-        }
 
-        const output: string[] = [];
-        const collectingConsole = {
-            info: (m: string) => {
-                output.push(m);
-            },
-            log: (m: string) => {
-                output.push(m);
-            },
-            error: (m: string) => {
-                output.push(m);
-            },
-            warn: (m: string) => {
-                output.push(m);
-            },
-        };
+        return new DumpFileDebugInfo().dump(workspace, fileUri, params.arguments, token);
+    }
+}
 
-        collectingConsole.info(`* Dump debug info for '${fileUri.toUserVisibleString()}'`);
+export class DumpFileDebugInfo {
+    dump(workspace: Workspace, fileUri: Uri, args: any[], token: CancellationToken) {
+        return workspace.service.run((p) => {
+            const kind = args[1];
 
-        switch (kind) {
-            case 'tokens': {
-                collectingConsole.info(`* Token info (${parseResults.tokenizerOutput.tokens.count} tokens)`);
+            const parseResults = workspace.service.getParseResults(workspace.service.fs.realCasePath(fileUri));
+            if (!parseResults) {
+                return [];
+            }
 
-                for (let i = 0; i < parseResults.tokenizerOutput.tokens.count; i++) {
-                    const token = parseResults.tokenizerOutput.tokens.getItemAt(i);
+            const output: string[] = [];
+            const collectingConsole = {
+                info: (m: string) => {
+                    output.push(m);
+                },
+                log: (m: string) => {
+                    output.push(m);
+                },
+                error: (m: string) => {
+                    output.push(m);
+                },
+                warn: (m: string) => {
+                    output.push(m);
+                },
+            };
+
+            collectingConsole.info(`* Dump debug info for '${fileUri.toUserVisibleString()}'`);
+
+            switch (kind) {
+                case 'tokens': {
+                    collectingConsole.info(`* Token info (${parseResults.tokenizerOutput.tokens.count} tokens)`);
+
+                    for (let i = 0; i < parseResults.tokenizerOutput.tokens.count; i++) {
+                        const token = parseResults.tokenizerOutput.tokens.getItemAt(i);
+                        collectingConsole.info(
+                            `[${i}] ${getTokenString(fileUri, token, parseResults.tokenizerOutput.lines)}`
+                        );
+                    }
+                    break;
+                }
+                case 'nodes': {
+                    collectingConsole.info(`* Node info`);
+
+                    const dumper = new TreeDumper(fileUri, parseResults.tokenizerOutput.lines);
+                    dumper.walk(parseResults.parserOutput.parseTree);
+
+                    collectingConsole.info(dumper.output);
+                    break;
+                }
+                case 'types': {
+                    const evaluator = p.evaluator;
+                    const start = args[2] as number;
+                    const end = args[3] as number;
+                    if (!evaluator || !start || !end) {
+                        return [];
+                    }
+
+                    collectingConsole.info(`* Type info`);
+                    collectingConsole.info(`${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end)}`);
+                    break;
+                }
+                case 'cachedtypes': {
+                    const evaluator = p.evaluator;
+                    const start = args[2] as number;
+                    const end = args[3] as number;
+                    if (!evaluator || !start || !end) {
+                        return [];
+                    }
+
+                    collectingConsole.info(`* Cached Type info`);
                     collectingConsole.info(
-                        `[${i}] ${getTokenString(fileUri, token, parseResults.tokenizerOutput.lines)}`
+                        `${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end, true)}`
                     );
-                }
-                break;
-            }
-            case 'nodes': {
-                collectingConsole.info(`* Node info`);
-
-                const dumper = new TreeDumper(fileUri, parseResults.tokenizerOutput.lines);
-                dumper.walk(parseResults.parseTree);
-
-                collectingConsole.info(dumper.output);
-                break;
-            }
-            case 'types': {
-                const evaluator = workspace.service.getEvaluator();
-                const start = params.arguments[2] as number;
-                const end = params.arguments[3] as number;
-                if (!evaluator || !start || !end) {
-                    return [];
+                    break;
                 }
 
-                collectingConsole.info(`* Type info`);
-                collectingConsole.info(`${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end)}`);
-                break;
-            }
-            case 'cachedtypes': {
-                const evaluator = workspace.service.getEvaluator();
-                const start = params.arguments[2] as number;
-                const end = params.arguments[3] as number;
-                if (!evaluator || !start || !end) {
-                    return [];
+                case 'codeflowgraph': {
+                    const evaluator = p.evaluator;
+                    const offset = args[2] as number;
+                    if (!evaluator || offset === undefined) {
+                        return [];
+                    }
+                    const node = findNodeByOffset(parseResults.parserOutput.parseTree, offset);
+                    if (!node) {
+                        return [];
+                    }
+                    const flowNode = getFlowNode(node);
+                    if (!flowNode) {
+                        return [];
+                    }
+                    collectingConsole.info(`* CodeFlow Graph`);
+                    evaluator.printControlFlowGraph(flowNode, undefined, 'Dump CodeFlowGraph', collectingConsole);
                 }
-
-                collectingConsole.info(`* Cached Type info`);
-                collectingConsole.info(`${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end, true)}`);
-                break;
             }
 
-            case 'codeflowgraph': {
-                const evaluator = workspace.service.getEvaluator();
-                const offset = params.arguments[2] as number;
-                if (!evaluator || offset === undefined) {
-                    return [];
-                }
-                const node = findNodeByOffset(parseResults.parseTree, offset);
-                if (!node) {
-                    return [];
-                }
-                const flowNode = getFlowNode(node);
-                if (!flowNode) {
-                    return [];
-                }
-                collectingConsole.info(`* CodeFlow Graph`);
-                evaluator.printControlFlowGraph(flowNode, undefined, 'Dump CodeFlowGraph', collectingConsole);
-            }
-        }
-
-        // Print all of the output in one message so the trace log is smaller.
-        this._ls.console.info(output.join('\n'));
+            // Print all of the output in one message so the trace log is smaller.
+            workspace.service.serviceProvider.console().info(output.join('\n'));
+            return [];
+        }, token);
     }
 }
 
@@ -240,13 +253,15 @@ function stringify(value: any, replacer: (this: any, key: string, value: any) =>
 function getTypeEvaluatorString(
     uri: Uri,
     evaluator: TypeEvaluator,
-    results: ParseResults,
+    results: ParseFileResults,
     start: number,
     end: number,
     cacheOnly?: boolean
 ) {
     const dumper = new TreeDumper(uri, results.tokenizerOutput.lines);
-    const node = findNodeByOffset(results.parseTree, start) ?? findNodeByOffset(results.parseTree, end);
+    const node =
+        findNodeByOffset(results.parserOutput.parseTree, start) ??
+        findNodeByOffset(results.parserOutput.parseTree, end);
     if (!node) {
         return 'N/A';
     }
@@ -453,7 +468,7 @@ const FunctionTypeFlagsToString: [FunctionTypeFlags, string][] = [
     [FunctionTypeFlags.ParamSpecValue, 'ParamSpecValue'],
     [FunctionTypeFlags.PartiallyEvaluated, 'PartiallyEvaluated'],
     [FunctionTypeFlags.PyTypedDefinition, 'PyTypedDefinition'],
-    [FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck, 'SkipArgsKwargsCompatibilityCheck'],
+    [FunctionTypeFlags.GradualCallableForm, 'SkipArgsKwargsCompatibilityCheck'],
     [FunctionTypeFlags.StaticMethod, 'StaticMethod'],
     [FunctionTypeFlags.StubDefinition, 'StubDefinition'],
     [FunctionTypeFlags.SynthesizedMethod, 'SynthesizedMethod'],
@@ -468,13 +483,9 @@ const ClassTypeFlagsToString: [ClassTypeFlags, string][] = [
     [ClassTypeFlags.BuiltInClass, 'BuiltInClass'],
     [ClassTypeFlags.CanOmitDictValues, 'CanOmitDictValues'],
     [ClassTypeFlags.ClassProperty, 'ClassProperty'],
-    [ClassTypeFlags.DataClass, 'DataClass'],
-    [ClassTypeFlags.DataClassKeywordOnlyParams, 'DataClassKeywordOnlyParams'],
     [ClassTypeFlags.DefinedInStub, 'DefinedInStub'],
     [ClassTypeFlags.EnumClass, 'EnumClass'],
     [ClassTypeFlags.Final, 'Final'],
-    [ClassTypeFlags.FrozenDataClass, 'FrozenDataClass'],
-    [ClassTypeFlags.GenerateDataClassSlots, 'GenerateDataClassSlots'],
     [ClassTypeFlags.HasCustomClassGetItem, 'HasCustomClassGetItem'],
     [ClassTypeFlags.PartiallyEvaluated, 'PartiallyEvaluated'],
     [ClassTypeFlags.PropertyClass, 'PropertyClass'],
@@ -482,12 +493,8 @@ const ClassTypeFlagsToString: [ClassTypeFlags, string][] = [
     [ClassTypeFlags.PseudoGenericClass, 'PseudoGenericClass'],
     [ClassTypeFlags.ReadOnlyInstanceVariables, 'ReadOnlyInstanceVariables'],
     [ClassTypeFlags.RuntimeCheckable, 'RuntimeCheckable'],
-    [ClassTypeFlags.SkipSynthesizedDataClassEq, 'SkipSynthesizedDataClassEq'],
-    [ClassTypeFlags.SkipSynthesizedDataClassInit, 'SkipSynthesizedDataClassInit'],
     [ClassTypeFlags.SpecialBuiltIn, 'SpecialBuiltIn'],
     [ClassTypeFlags.SupportsAbstractMethods, 'SupportsAbstractMethods'],
-    [ClassTypeFlags.SynthesizeDataClassUnsafeHash, 'SynthesizeDataClassUnsafeHash'],
-    [ClassTypeFlags.SynthesizedDataClassOrder, 'SynthesizedDataClassOrder'],
     [ClassTypeFlags.TupleClass, 'TupleClass'],
     [ClassTypeFlags.TypedDictClass, 'TypedDictClass'],
     [ClassTypeFlags.TypingExtensionClass, 'TypingExtensionClass'],
@@ -626,7 +633,17 @@ class TreeDumper extends ParseTreeWalker {
         return true;
     }
 
-    override visitTernary(node: TernaryNode) {
+    override visitComprehension(node: ComprehensionNode) {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitComprehensionFor(node: ComprehensionForNode) {
+        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
+        return true;
+    }
+
+    override visitComprehensionIf(node: ComprehensionIfNode) {
         this._log(`${this._getPrefix(node)}`);
         return true;
     }
@@ -752,21 +769,6 @@ class TreeDumper extends ParseTreeWalker {
         return true;
     }
 
-    override visitListComprehension(node: ListComprehensionNode) {
-        this._log(`${this._getPrefix(node)}`);
-        return true;
-    }
-
-    override visitListComprehensionFor(node: ListComprehensionForNode) {
-        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
-        return true;
-    }
-
-    override visitListComprehensionIf(node: ListComprehensionIfNode) {
-        this._log(`${this._getPrefix(node)}`);
-        return true;
-    }
-
     override visitMemberAccess(node: MemberAccessNode) {
         this._log(`${this._getPrefix(node)}`);
         return true;
@@ -843,6 +845,11 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitSuite(node: SuiteNode) {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitTernary(node: TernaryNode) {
         this._log(`${this._getPrefix(node)}`);
         return true;
     }

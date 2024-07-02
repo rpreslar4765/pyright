@@ -74,7 +74,6 @@ export type UnionableType =
 export type Type = UnionableType | NeverType | UnionType;
 
 export type TypeVarScopeId = string;
-export const WildcardTypeVarScopeId = '*';
 export const InScopePlaceholderScopeId = '-';
 
 export class EnumLiteral {
@@ -251,6 +250,10 @@ export namespace TypeBase {
             newInstance.instantiableNestingLevel =
                 newInstance.instantiableNestingLevel === undefined ? 1 : newInstance.instantiableNestingLevel;
         }
+
+        // Remove type alias information because the type will no longer match
+        // that of the type alias definition.
+        delete newInstance.typeAliasInfo;
 
         // Should we cache it for next time?
         if (cache) {
@@ -473,125 +476,106 @@ export const enum ClassTypeFlags {
     // and 'Union'.
     SpecialBuiltIn = 1 << 1,
 
-    // Introduced in Python 3.7 - class either derives directly
-    // from NamedTuple or has a @dataclass class decorator.
-    DataClass = 1 << 2,
-
-    // Indicates that the dataclass is frozen.
-    FrozenDataClass = 1 << 3,
-
-    // Flags that control whether methods should be
-    // synthesized for a dataclass class.
-    SkipSynthesizedDataClassInit = 1 << 4,
-    SkipSynthesizedDataClassEq = 1 << 5,
-    SynthesizedDataClassOrder = 1 << 6,
-
     // Introduced in PEP 589, TypedDict classes provide a way
     // to specify type hints for dictionaries with different
     // value types and a limited set of static keys.
-    TypedDictClass = 1 << 7,
+    TypedDictClass = 1 << 2,
 
     // Used in conjunction with TypedDictClass, indicates that
     // the TypedDict class is marked "closed".
-    TypedDictMarkedClosed = 1 << 8,
+    TypedDictMarkedClosed = 1 << 3,
 
     // Used in conjunction with TypedDictClass, indicates that
     // the TypedDict class is marked "closed" or one or more of
     // its superclasses is marked "closed".
-    TypedDictEffectivelyClosed = 1 << 9,
+    TypedDictEffectivelyClosed = 1 << 4,
 
     // Used in conjunction with TypedDictClass, indicates that
     // the dictionary values can be omitted.
-    CanOmitDictValues = 1 << 10,
+    CanOmitDictValues = 1 << 5,
 
     // The class derives from a class that has the ABCMeta
     // metaclass. Such classes are allowed to contain
     // @abstractmethod decorators.
-    SupportsAbstractMethods = 1 << 11,
+    SupportsAbstractMethods = 1 << 6,
 
     // Derives from property class and has the semantics of
     // a property (with optional setter, deleter).
-    PropertyClass = 1 << 12,
+    PropertyClass = 1 << 7,
 
     // The class is decorated with a "@final" decorator
     // indicating that it cannot be subclassed.
-    Final = 1 << 13,
+    Final = 1 << 8,
 
     // The class derives directly from "Protocol".
-    ProtocolClass = 1 << 14,
+    ProtocolClass = 1 << 9,
 
     // A class whose constructor (__init__ method) does not have
     // annotated types and is treated as though each parameter
     // is a generic type for purposes of type inference.
-    PseudoGenericClass = 1 << 15,
+    PseudoGenericClass = 1 << 10,
 
     // A protocol class that is "runtime checkable" can be used
     // in an isinstance call.
-    RuntimeCheckable = 1 << 16,
+    RuntimeCheckable = 1 << 11,
 
     // The type is defined in the typing_extensions.pyi file.
-    TypingExtensionClass = 1 << 17,
+    TypingExtensionClass = 1 << 12,
 
     // The class type is in the process of being evaluated and
     // is not yet complete. This allows us to detect cases where
     // the class refers to itself (e.g. uses itself as a type
     // argument to one of its generic base classes).
-    PartiallyEvaluated = 1 << 18,
+    PartiallyEvaluated = 1 << 13,
 
     // The class or one of its ancestors defines a __class_getitem__
     // method that is used for subscripting. This is not set if the
     // class is generic, and therefore supports standard subscripting
     // semantics.
-    HasCustomClassGetItem = 1 << 19,
+    HasCustomClassGetItem = 1 << 14,
 
     // The tuple class uses a variadic type parameter and requires
     // special-case handling of its type arguments.
-    TupleClass = 1 << 20,
+    TupleClass = 1 << 15,
 
     // The class has a metaclass of EnumMeta or derives from
     // a class that has this metaclass.
-    EnumClass = 1 << 21,
-
-    // For dataclasses, should __init__ method always be generated
-    // with keyword-only parameters?
-    DataClassKeywordOnlyParams = 1 << 22,
+    EnumClass = 1 << 16,
 
     // Properties that are defined using the @classmethod decorator.
-    ClassProperty = 1 << 23,
+    ClassProperty = 1 << 17,
 
     // Class is declared within a type stub file.
-    DefinedInStub = 1 << 24,
+    DefinedInStub = 1 << 18,
 
     // Class does not allow writing or deleting its instance variables
     // through a member access. Used with named tuples.
-    ReadOnlyInstanceVariables = 1 << 25,
-
-    // For dataclasses, should __slots__ be generated?
-    GenerateDataClassSlots = 1 << 26,
-
-    // For dataclasses, should __hash__ be generated?
-    SynthesizeDataClassUnsafeHash = 1 << 27,
+    ReadOnlyInstanceVariables = 1 << 19,
 
     // Decorated with @type_check_only.
-    TypeCheckOnly = 1 << 28,
+    TypeCheckOnly = 1 << 20,
 
     // Created with the NewType call.
-    NewTypeClass = 1 << 29,
+    NewTypeClass = 1 << 21,
 
     // Class is allowed to be used as an implicit type alias even
     // though it is not defined using a `class` statement.
-    ValidTypeAliasClass = 1 << 30,
+    ValidTypeAliasClass = 1 << 22,
 
     // A special form is not compatible with type[T] and cannot
     // be directly instantiated.
-    SpecialFormClass = 1 << 31,
+    SpecialFormClass = 1 << 23,
 }
 
 export interface DataClassBehaviors {
-    keywordOnlyParams: boolean;
-    generateEq: boolean;
-    generateOrder: boolean;
-    frozen: boolean;
+    skipGenerateInit?: boolean;
+    skipGenerateEq?: boolean;
+    generateOrder?: boolean;
+    generateSlots?: boolean;
+    generateHash?: boolean;
+    keywordOnly?: boolean;
+    frozen?: boolean;
+    frozenDefault?: boolean;
     fieldDescriptorNames: string[];
 }
 
@@ -603,7 +587,7 @@ interface ClassDetails {
     flags: ClassTypeFlags;
     typeSourceId: TypeSourceId;
     baseClasses: Type[];
-    mro: Type[];
+    mro: (ClassType | AnyType | UnknownType)[];
     declaration?: ClassDeclaration | SpecialBuiltInClassDeclaration | undefined;
     declaredMetaclass?: ClassType | UnknownType | undefined;
     effectiveMetaclass?: ClassType | UnknownType | undefined;
@@ -611,12 +595,15 @@ interface ClassDetails {
     typeParameters: TypeVarType[];
     typeVarScopeId?: TypeVarScopeId | undefined;
     docString?: string | undefined;
-    deprecatedMessage?: string | undefined;
     dataClassEntries?: DataClassEntry[] | undefined;
     dataClassBehaviors?: DataClassBehaviors | undefined;
     typedDictEntries?: TypedDictEntries | undefined;
-    inheritedSlotsNames?: string[];
     localSlotsNames?: string[];
+
+    // If the class is decorated with a @deprecated decorator, this
+    // string provides the message to be displayed when the class
+    // is used.
+    deprecatedMessage?: string | undefined;
 
     // A cache of protocol classes (indexed by the class full name)
     // that have been determined to be compatible or incompatible
@@ -635,6 +622,13 @@ interface ClassDetails {
     // A cached value that indicates whether an instance of this class
     // is hashable (i.e. does not override "__hash__" with None).
     isInstanceHashable?: boolean;
+
+    // Callback for deferred synthesis of methods in symbol table.
+    synthesizeMethodsDeferred?: () => void;
+
+    // Callback for calculating inherited slots names.
+    calculateInheritedSlotsNamesDeferred?: () => void;
+    inheritedSlotsNamesCached?: string[];
 }
 
 export interface TupleTypeArgument {
@@ -741,6 +735,11 @@ export interface ClassType extends TypeBase {
     fgetInfo?: PropertyMethodInfo | undefined;
     fsetInfo?: PropertyMethodInfo | undefined;
     fdelInfo?: PropertyMethodInfo | undefined;
+
+    // Provides the deprecated message specifically for instances of
+    // the "deprecated" class. This allows these instances to be used
+    // as decorators for other classes or functions.
+    deprecatedInstanceMessage?: string | undefined;
 }
 
 export namespace ClassType {
@@ -826,13 +825,7 @@ export namespace ClassType {
             newClassType.includeSubclasses = true;
         }
 
-        newClassType.tupleTypeArguments = tupleTypeArguments
-            ? tupleTypeArguments.map((t) =>
-                  isNever(t.type)
-                      ? { type: UnknownType.create(), isUnbounded: t.isUnbounded, isOptional: t.isOptional }
-                      : t
-              )
-            : undefined;
+        newClassType.tupleTypeArguments = tupleTypeArguments ? [...tupleTypeArguments] : undefined;
 
         if (isEmptyContainer !== undefined) {
             newClassType.isEmptyContainer = isEmptyContainer;
@@ -854,6 +847,17 @@ export namespace ClassType {
     export function cloneWithLiteral(classType: ClassType, value: LiteralValue | undefined): ClassType {
         const newClassType = TypeBase.cloneType(classType);
         newClassType.literalValue = value;
+
+        // Remove type alias information because the type will no longer match
+        // that of the type alias definition if we change the literal type.
+        delete newClassType.typeAliasInfo;
+
+        return newClassType;
+    }
+
+    export function cloneForDeprecatedInstance(type: ClassType, deprecatedMessage?: string): ClassType {
+        const newClassType = TypeBase.cloneType(type);
+        newClassType.deprecatedInstanceMessage = deprecatedMessage;
         return newClassType;
     }
 
@@ -1030,44 +1034,40 @@ export namespace ClassType {
         return true;
     }
 
-    export function derivesFromAnyOrUnknown(classType: ClassType) {
-        return classType.details.mro.some((mroClass) => !isClass(mroClass));
-    }
-
     export function supportsAbstractMethods(classType: ClassType) {
         return !!(classType.details.flags & ClassTypeFlags.SupportsAbstractMethods);
     }
 
     export function isDataClass(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.DataClass);
+        return !!classType.details.dataClassBehaviors;
     }
 
-    export function isSkipSynthesizedDataClassInit(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.SkipSynthesizedDataClassInit);
+    export function isDataClassSkipGenerateInit(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.skipGenerateInit;
     }
 
-    export function isSkipSynthesizedDataClassEq(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.SkipSynthesizedDataClassEq);
+    export function isDataClassSkipGenerateEq(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.skipGenerateEq;
     }
 
-    export function isFrozenDataClass(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.FrozenDataClass);
+    export function isDataClassFrozen(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.frozen;
     }
 
-    export function isSynthesizedDataclassOrder(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.SynthesizedDataClassOrder);
+    export function isDataClassGenerateOrder(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.generateOrder;
     }
 
-    export function isDataClassKeywordOnlyParams(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.DataClassKeywordOnlyParams);
+    export function isDataClassKeywordOnly(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.keywordOnly;
     }
 
-    export function isGeneratedDataClassSlots(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.GenerateDataClassSlots);
+    export function isDataClassGenerateSlots(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.generateSlots;
     }
 
-    export function isSynthesizeDataClassUnsafeHash(classType: ClassType) {
-        return !!(classType.details.flags & ClassTypeFlags.SynthesizeDataClassUnsafeHash);
+    export function isDataClassGenerateHash(classType: ClassType) {
+        return !!classType.details.dataClassBehaviors?.generateHash;
     }
 
     export function isTypeCheckOnly(classType: ClassType) {
@@ -1131,6 +1131,8 @@ export namespace ClassType {
     }
 
     export function getDataClassEntries(classType: ClassType): DataClassEntry[] {
+        classType.details.synthesizeMethodsDeferred?.();
+
         return classType.details.dataClassEntries || [];
     }
 
@@ -1162,8 +1164,24 @@ export namespace ClassType {
         return classType.details.typeParameters;
     }
 
-    export function hasUnknownBaseClass(classType: ClassType) {
+    export function derivesFromAnyOrUnknown(classType: ClassType) {
         return classType.details.mro.some((baseClass) => isAnyOrUnknown(baseClass));
+    }
+
+    export function getSymbolTable(classType: ClassType) {
+        classType.details.synthesizeMethodsDeferred?.();
+
+        return classType.details.fields;
+    }
+
+    export function getInheritedSlotsNames(classType: ClassType) {
+        // First synthesize methods if needed. The slots entries
+        // can depend on synthesized methods.
+        classType.details.synthesizeMethodsDeferred?.();
+
+        classType.details.calculateInheritedSlotsNamesDeferred?.();
+
+        return classType.details.inheritedSlotsNamesCached;
     }
 
     // Similar to isPartiallyEvaluated except that it also looks at all of the
@@ -1272,6 +1290,16 @@ export namespace ClassType {
     ): boolean {
         // Is it the exact same class?
         if (isSameGenericClass(subclassType, parentClassType)) {
+            // Handle literal types.
+            if (parentClassType.literalValue !== undefined) {
+                if (
+                    subclassType.literalValue === undefined ||
+                    !ClassType.isLiteralValueSame(parentClassType, subclassType)
+                ) {
+                    return false;
+                }
+            }
+
             if (inheritanceChain) {
                 inheritanceChain.push(subclassType);
             }
@@ -1317,7 +1345,7 @@ export namespace ClassType {
         return false;
     }
 
-    export function getReverseMro(classType: ClassType): Type[] {
+    export function getReverseMro(classType: ClassType): (ClassType | UnknownType | AnyType)[] {
         return classType.details.mro.slice(0).reverse();
     }
 }
@@ -1399,7 +1427,7 @@ export const enum FunctionTypeFlags {
     // The *args and **kwargs parameters do not need to be present for this
     // function to be compatible. This is used for Callable[..., x] and
     // ... type arguments to ParamSpec and Concatenate.
-    SkipArgsKwargsCompatibilityCheck = 1 << 15,
+    GradualCallableForm = 1 << 15,
 
     // This function represents the value bound to a ParamSpec, so its return
     // type is not meaningful.
@@ -1440,23 +1468,14 @@ interface FunctionDetails {
     // as a decorator.
     decoratorDataClassBehaviors?: DataClassBehaviors | undefined;
 
-    // Parameter specification used only for Callable types created
-    // with a ParamSpec representing the parameters.
-    paramSpec?: TypeVarType | undefined;
-
-    // If the function is generic (has one or more typeParameters) and
-    // one or more of these appear only within the return type and within
-    // a callable, they are rescoped to that callable.
-    rescopedTypeParameters?: TypeVarType[];
-
     // For __new__ and __init__ methods, the TypeVar scope ID of the
     // associated class.
     constructorTypeVarScopeId?: TypeVarScopeId | undefined;
 
     // For functions whose parameter lists derive from a solved
-    // ParamSpec, this is the TypeVar scope ID of the signature
-    // captured by that ParamSpec.
-    paramSpecTypeVarScopeId?: TypeVarScopeId | undefined;
+    // ParamSpec or higher-order generic functions, this is a list of
+    // additional TypeVar IDs that may need to be solved.
+    higherOrderTypeVarScopeIds?: TypeVarScopeId[];
 }
 
 export interface SpecializedFunctionTypes {
@@ -1512,7 +1531,8 @@ export interface FunctionType extends TypeBase {
     // The flags for the function prior to binding
     preBoundFlags?: FunctionTypeFlags;
 
-    // The type var scope for the class that the function was bound to
+    // The type var scope for the class that the function was bound to.
+    // This applies only to constructor methods.
     boundTypeVarScopeId?: TypeVarScopeId | undefined;
 
     // If this function is part of an overloaded function, this
@@ -1582,18 +1602,12 @@ export namespace FunctionType {
         boundToType?: ClassType,
         boundTypeVarScopeId?: TypeVarScopeId
     ): FunctionType {
-        const newFunction = create(
-            type.details.name,
-            type.details.fullName,
-            type.details.moduleName,
-            type.details.flags,
-            type.flags,
-            type.details.docString
-        );
+        const newFunction = TypeBase.cloneType(type);
 
         newFunction.details = { ...type.details };
-        newFunction.boundToType = boundToType ?? type.boundToType;
         newFunction.preBoundFlags = newFunction.details.flags;
+        newFunction.boundToType = boundToType;
+        newFunction.boundTypeVarScopeId = boundTypeVarScopeId;
 
         if (stripFirstParam) {
             if (type.details.parameters.length > 0) {
@@ -1632,7 +1646,6 @@ export namespace FunctionType {
         }
 
         newFunction.inferredReturnType = type.inferredReturnType;
-        newFunction.boundTypeVarScopeId = boundTypeVarScopeId ?? type.boundTypeVarScopeId;
 
         return newFunction;
     }
@@ -1664,129 +1677,97 @@ export namespace FunctionType {
         specializedTypes: SpecializedFunctionTypes,
         specializedInferredReturnType: Type | undefined
     ): FunctionType {
-        const newFunction = create(
-            type.details.name,
-            type.details.fullName,
-            type.details.moduleName,
-            type.details.flags,
-            type.flags,
-            type.details.docString
-        );
-        newFunction.details = type.details;
+        const newFunction = TypeBase.cloneType(type);
 
         assert(specializedTypes.parameterTypes.length === type.details.parameters.length);
         if (specializedTypes.parameterDefaultArgs) {
             assert(specializedTypes.parameterDefaultArgs.length === type.details.parameters.length);
         }
-        newFunction.specializedTypes = specializedTypes;
 
-        if (specializedInferredReturnType) {
-            newFunction.inferredReturnType = specializedInferredReturnType;
-        }
+        newFunction.specializedTypes = specializedTypes;
+        newFunction.inferredReturnType = specializedInferredReturnType;
 
         return newFunction;
     }
 
     // Creates a new function based on the parameters of another function.
-    export function cloneForParamSpec(type: FunctionType, paramSpecValue: FunctionType | undefined): FunctionType {
-        const newFunction = create(
-            type.details.name,
-            type.details.fullName,
-            type.details.moduleName,
-            type.details.flags,
-            type.flags,
-            type.details.docString
-        );
+    export function applyParamSpecValue(type: FunctionType, paramSpecValue: FunctionType): FunctionType {
+        const hasPositionalOnly = paramSpecValue.details.parameters.some((param) => isPositionOnlySeparator(param));
+        const newFunction = FunctionType.cloneRemoveParamSpecArgsKwargs(TypeBase.cloneType(type), hasPositionalOnly);
+        const paramSpec = FunctionType.getParamSpecFromArgsKwargs(type);
+        assert(paramSpec !== undefined);
 
         // Make a shallow clone of the details.
-        newFunction.details = { ...type.details };
+        newFunction.details = { ...newFunction.details };
 
-        // The clone should no longer have a parameter specification
-        // since we're replacing it.
-        delete newFunction.details.paramSpec;
+        newFunction.details.typeParameters = newFunction.details.typeParameters.filter(
+            (t) => !isTypeSame(t, paramSpec)
+        );
 
-        if (paramSpecValue) {
-            const typeParameters = Array.from(type.details.parameters);
-            let droppedLastParam = false;
+        const prevParams = Array.from(newFunction.details.parameters);
 
-            // If the paramSpec includes a position-only separator
-            // and the existing function ends on a position-only separator,
-            // we need to remove the latter in favor of the former.
-            if (paramSpecValue.details.parameters.some((param) => isPositionOnlySeparator(param))) {
-                if (typeParameters.length > 0 && isPositionOnlySeparator(typeParameters[typeParameters.length - 1])) {
-                    typeParameters.pop();
-                    droppedLastParam = true;
-                }
-            }
-
-            newFunction.details.parameters = [
-                ...typeParameters,
-                ...paramSpecValue.details.parameters.map((param) => {
-                    return {
-                        category: param.category,
-                        name: param.name,
-                        hasDefault: param.hasDefault,
-                        defaultValueExpression: param.defaultValueExpression,
-                        isNameSynthesized: param.isNameSynthesized,
-                        hasDeclaredType: true,
-                        type: param.type,
-                    };
-                }),
-            ];
-
-            if (newFunction.details.docString === undefined) {
-                newFunction.details.docString = paramSpecValue.details.docString;
-            }
-
-            if (newFunction.details.deprecatedMessage === undefined) {
-                newFunction.details.deprecatedMessage = paramSpecValue.details.deprecatedMessage;
-            }
-
-            newFunction.details.flags =
-                (paramSpecValue.details.flags &
-                    (FunctionTypeFlags.ClassMethod |
-                        FunctionTypeFlags.StaticMethod |
-                        FunctionTypeFlags.ConstructorMethod |
-                        FunctionTypeFlags.Overloaded |
-                        FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck)) |
-                FunctionTypeFlags.SynthesizedMethod;
-
-            if (FunctionType.isParamSpecValue(type)) {
-                newFunction.details.flags |= FunctionTypeFlags.ParamSpecValue;
-            }
-
-            // Update the specialized parameter types as well.
-            if (type.specializedTypes) {
-                newFunction.specializedTypes = {
-                    parameterTypes: Array.from(type.specializedTypes.parameterTypes),
-                    returnType: type.specializedTypes.returnType,
+        newFunction.details.parameters = [
+            ...prevParams,
+            ...paramSpecValue.details.parameters.map((param) => {
+                return {
+                    category: param.category,
+                    name: param.name,
+                    hasDefault: param.hasDefault,
+                    defaultValueExpression: param.defaultValueExpression,
+                    isNameSynthesized: param.isNameSynthesized,
+                    hasDeclaredType: true,
+                    type: param.type,
                 };
-                if (droppedLastParam) {
-                    newFunction.specializedTypes.parameterTypes.pop();
-                }
+            }),
+        ];
 
-                if (type.specializedTypes.parameterDefaultArgs) {
-                    newFunction.specializedTypes.parameterDefaultArgs = Array.from(
-                        type.specializedTypes.parameterDefaultArgs
-                    );
+        if (newFunction.details.docString === undefined) {
+            newFunction.details.docString = paramSpecValue.details.docString;
+        }
 
-                    if (droppedLastParam) {
-                        newFunction.specializedTypes.parameterDefaultArgs.pop();
-                    }
-                }
+        if (newFunction.details.deprecatedMessage === undefined) {
+            newFunction.details.deprecatedMessage = paramSpecValue.details.deprecatedMessage;
+        }
 
-                paramSpecValue.details.parameters.forEach((paramInfo) => {
-                    newFunction.specializedTypes!.parameterTypes.push(paramInfo.type);
-                    if (newFunction.specializedTypes!.parameterDefaultArgs) {
-                        // Assume that the parameters introduced via paramSpec have no specialized
-                        // default arg types. Fall back on the original default arg type in this case.
-                        newFunction.specializedTypes!.parameterDefaultArgs.push(undefined);
-                    }
-                });
-            }
+        const origFlagsMask = FunctionTypeFlags.Overloaded | FunctionTypeFlags.ParamSpecValue;
+        newFunction.details.flags = type.details.flags & origFlagsMask;
 
-            newFunction.details.paramSpecTypeVarScopeId = paramSpecValue.details.typeVarScopeId;
-            newFunction.details.paramSpec = paramSpecValue.details.paramSpec;
+        const methodFlagsMask =
+            FunctionTypeFlags.ClassMethod | FunctionTypeFlags.StaticMethod | FunctionTypeFlags.ConstructorMethod;
+
+        // If the original function was a method, use its method type. Otherwise
+        // use the method type of the param spec.
+        if (type.details.methodClass) {
+            newFunction.details.flags |= type.details.flags & methodFlagsMask;
+        } else {
+            newFunction.details.flags |= paramSpecValue.details.flags & methodFlagsMask;
+        }
+
+        // Use the "..." flag from the param spec.
+        newFunction.details.flags |= paramSpecValue.details.flags & FunctionTypeFlags.GradualCallableForm;
+
+        // Mark the function as synthesized since there is no user-defined declaration for it.
+        newFunction.details.flags |= FunctionTypeFlags.SynthesizedMethod;
+        delete newFunction.details.declaration;
+
+        // Update the specialized parameter types as well.
+        const specializedTypes = newFunction.specializedTypes;
+        if (specializedTypes) {
+            paramSpecValue.details.parameters.forEach((paramInfo) => {
+                specializedTypes.parameterTypes.push(paramInfo.type);
+
+                // Assume that the parameters introduced via paramSpec have no specialized
+                // default arg types. Fall back on the original default arg type in this case.
+                specializedTypes.parameterDefaultArgs?.push(undefined);
+            });
+        }
+
+        FunctionType.addHigherOrderTypeVarScopeIds(newFunction, paramSpecValue.details.typeVarScopeId);
+        FunctionType.addHigherOrderTypeVarScopeIds(newFunction, paramSpecValue.details.higherOrderTypeVarScopeIds);
+        newFunction.details.constructorTypeVarScopeId = paramSpecValue.details.constructorTypeVarScopeId;
+
+        if (!newFunction.details.methodClass && paramSpecValue.details.methodClass) {
+            newFunction.details.methodClass = paramSpecValue.details.methodClass;
         }
 
         return newFunction;
@@ -1816,6 +1797,11 @@ export namespace FunctionType {
         newFunction.details.typeParameters = typeParameters;
         newFunction.trackedSignatures = trackedSignatures;
 
+        FunctionType.addHigherOrderTypeVarScopeIds(
+            newFunction,
+            typeParameters.map((t) => t.scopeId)
+        );
+
         return newFunction;
     }
 
@@ -1841,107 +1827,67 @@ export namespace FunctionType {
         return newFunction;
     }
 
-    // Creates a new function based on a solved ParamSpec. The input type is assumed to
-    // have a signature that ends in "*args: P.args, **kwargs: P.kwargs". These will be
-    // replaced by the parameters in the ParamSpec.
-    export function cloneForParamSpecApplication(type: FunctionType, paramSpecValue: FunctionType): FunctionType {
+    // If the function ends with "*args: P.args, **kwargs: P.kwargs", this function
+    // returns a new function that is a clone of the input function with the
+    // *args and **kwargs parameters removed. If stripPositionOnlySeparator is true,
+    // a trailing positional-only separator will be removed.
+    export function cloneRemoveParamSpecArgsKwargs(
+        type: FunctionType,
+        stripPositionOnlySeparator = false
+    ): FunctionType {
+        const paramCount = type.details.parameters.length;
+        if (paramCount < 2) {
+            return type;
+        }
+
+        const argsParam = type.details.parameters[paramCount - 2];
+        const kwargsParam = type.details.parameters[paramCount - 1];
+
+        if (
+            argsParam.category !== ParameterCategory.ArgsList ||
+            kwargsParam.category !== ParameterCategory.KwargsDict
+        ) {
+            return type;
+        }
+
+        const argsType = FunctionType.getEffectiveParameterType(type, paramCount - 2);
+        const kwargsType = FunctionType.getEffectiveParameterType(type, paramCount - 1);
+        if (!isParamSpec(argsType) || !isParamSpec(kwargsType) || !isTypeSame(argsType, kwargsType)) {
+            return type;
+        }
+
         const newFunction = TypeBase.cloneType(type);
 
         // Make a shallow clone of the details.
         newFunction.details = { ...type.details };
+        const details = newFunction.details;
 
-        // Remove the last two parameters, which are the *args and **kwargs.
-        newFunction.details.parameters = newFunction.details.parameters.slice(
-            0,
-            newFunction.details.parameters.length - 2
-        );
+        let paramsToDrop = 2;
 
-        if (newFunction.specializedTypes) {
-            newFunction.specializedTypes.parameterTypes = newFunction.specializedTypes.parameterTypes.slice(
-                0,
-                newFunction.specializedTypes.parameterTypes.length - 2
-            );
-        }
-
-        // Update the flags of the function.
-        newFunction.details.flags &= ~FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck;
-        if (paramSpecValue.details.flags & FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck) {
-            newFunction.details.flags |= FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck;
-        }
-
-        // If there is a position-only separator in the captured param spec signature,
-        // remove the position-only separator in the existing signature. Otherwise,
-        // we'll end up with redundant position-only separators.
-        if (paramSpecValue.details.parameters.some((entry) => isPositionOnlySeparator(entry))) {
-            if (newFunction.details.parameters.length > 0) {
-                const lastParam = newFunction.details.parameters[newFunction.details.parameters.length - 1];
-                if (isPositionOnlySeparator(lastParam)) {
-                    newFunction.details.parameters.pop();
-                }
+        // If the last remaining parameter is a position-only separator, remove it as well.
+        // Always remove it if it's the only remaining parameter.
+        if (paramCount >= 3 && isPositionOnlySeparator(details.parameters[paramCount - 3])) {
+            if (paramCount === 3 || stripPositionOnlySeparator) {
+                paramsToDrop = 3;
             }
         }
 
-        paramSpecValue.details.parameters.forEach((param) => {
-            newFunction.details.parameters.push({
-                category: param.category,
-                name: param.name,
-                hasDefault: param.hasDefault,
-                defaultValueExpression: param.defaultValueExpression,
-                isNameSynthesized: param.isNameSynthesized,
-                hasDeclaredType: true,
-                type: param.type,
-            });
-        });
-
-        newFunction.details.paramSpec = paramSpecValue.details.paramSpec;
-        if (!newFunction.details.docString) {
-            newFunction.details.docString = paramSpecValue.details.docString;
-        }
-
-        // Note the TypeVar scope ID of the original captured function. This
-        // allows any unsolved TypeVars within that scope to be solved when the
-        // resulting function is called.
-        newFunction.details.paramSpecTypeVarScopeId = paramSpecValue.details.typeVarScopeId;
-
-        return newFunction;
-    }
-
-    export function cloneRemoveParamSpecVariadics(type: FunctionType, paramSpec: TypeVarType): FunctionType {
-        const newFunction = create(
-            type.details.name,
-            type.details.fullName,
-            type.details.moduleName,
-            type.details.flags,
-            type.flags,
-            type.details.docString
-        );
-
-        // Make a shallow clone of the details.
-        newFunction.details = { ...type.details };
-
-        // Remove the last two parameters, which are the *args and **kwargs.
-        newFunction.details.parameters = newFunction.details.parameters.slice(
-            0,
-            newFunction.details.parameters.length - 2
-        );
+        // Remove the last parameters, which are the *args and **kwargs.
+        details.parameters = details.parameters.slice(0, details.parameters.length - paramsToDrop);
 
         if (type.specializedTypes) {
             newFunction.specializedTypes = { ...type.specializedTypes };
             newFunction.specializedTypes.parameterTypes = newFunction.specializedTypes.parameterTypes.slice(
                 0,
-                newFunction.specializedTypes.parameterTypes.length - 2
+                newFunction.specializedTypes.parameterTypes.length - paramsToDrop
             );
             if (newFunction.specializedTypes.parameterDefaultArgs) {
                 newFunction.specializedTypes.parameterDefaultArgs =
                     newFunction.specializedTypes.parameterDefaultArgs.slice(
                         0,
-                        newFunction.specializedTypes.parameterDefaultArgs.length - 2
+                        newFunction.specializedTypes.parameterDefaultArgs.length - paramsToDrop
                     );
             }
-        }
-
-        if (!newFunction.details.paramSpec) {
-            newFunction.details.paramSpec = paramSpec;
         }
 
         if (type.inferredReturnType) {
@@ -1951,9 +1897,78 @@ export namespace FunctionType {
         return newFunction;
     }
 
-    export function addDefaultParameters(functionType: FunctionType, useUnknown = false) {
+    // If the function ends with "*args: P.args, **kwargs: P.kwargs", this function
+    // returns P. Otherwise, it returns undefined.
+    export function getParamSpecFromArgsKwargs(type: FunctionType): TypeVarType | undefined {
+        const params = type.details.parameters;
+        if (params.length < 2) {
+            return undefined;
+        }
+
+        const secondLastParam = params[params.length - 2];
+        const lastParam = params[params.length - 1];
+
+        if (
+            secondLastParam.category === ParameterCategory.ArgsList &&
+            isTypeVar(secondLastParam.type) &&
+            secondLastParam.type.paramSpecAccess === 'args' &&
+            lastParam.category === ParameterCategory.KwargsDict &&
+            isTypeVar(lastParam.type) &&
+            lastParam.type.paramSpecAccess === 'kwargs'
+        ) {
+            return TypeVarType.cloneForParamSpecAccess(secondLastParam.type, /* access */ undefined);
+        }
+
+        return undefined;
+    }
+
+    export function addParamSpecVariadics(type: FunctionType, paramSpec: TypeVarType) {
+        FunctionType.addParameter(type, {
+            category: ParameterCategory.ArgsList,
+            name: 'args',
+            type: TypeVarType.cloneForParamSpecAccess(paramSpec, 'args'),
+            hasDeclaredType: true,
+        });
+
+        FunctionType.addParameter(type, {
+            category: ParameterCategory.KwargsDict,
+            name: 'kwargs',
+            type: TypeVarType.cloneForParamSpecAccess(paramSpec, 'kwargs'),
+            hasDeclaredType: true,
+        });
+    }
+
+    export function addDefaultParameters(type: FunctionType, useUnknown = false) {
         getDefaultParameters(useUnknown).forEach((param) => {
-            FunctionType.addParameter(functionType, param);
+            FunctionType.addParameter(type, param);
+        });
+    }
+
+    export function addHigherOrderTypeVarScopeIds(
+        functionType: FunctionType,
+        scopeIds: (TypeVarScopeId | undefined)[] | TypeVarScopeId | undefined
+    ) {
+        if (!scopeIds) {
+            return;
+        }
+
+        if (!Array.isArray(scopeIds)) {
+            scopeIds = [scopeIds];
+        }
+
+        if (!functionType.details.higherOrderTypeVarScopeIds) {
+            functionType.details.higherOrderTypeVarScopeIds = [];
+        }
+
+        // Add the scope IDs to the function if they're unique.
+        scopeIds.forEach((scopeId) => {
+            if (!scopeId || scopeId === functionType.details.typeVarScopeId) {
+                return;
+            }
+
+            if (!functionType.details.higherOrderTypeVarScopeIds!.some((id) => id === scopeId)) {
+                functionType.details.higherOrderTypeVarScopeIds!.push(scopeId);
+            }
         });
     }
 
@@ -2069,8 +2084,8 @@ export namespace FunctionType {
         return (type.details.flags & FunctionTypeFlags.UnannotatedParams) !== 0;
     }
 
-    export function shouldSkipArgsKwargsCompatibilityCheck(type: FunctionType) {
-        return (type.details.flags & FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck) !== 0;
+    export function isGradualCallableForm(type: FunctionType) {
+        return (type.details.flags & FunctionTypeFlags.GradualCallableForm) !== 0;
     }
 
     export function isParamSpecValue(type: FunctionType) {
@@ -2130,7 +2145,7 @@ export namespace FunctionType {
         });
     }
 
-    export function getSpecializedReturnType(type: FunctionType, includeInferred = true) {
+    export function getEffectiveReturnType(type: FunctionType, includeInferred = true) {
         if (type.specializedTypes?.returnType) {
             return type.specializedTypes.returnType;
         }
@@ -2502,7 +2517,7 @@ export interface TypeVarDetails {
     synthesizedIndex?: number | undefined;
     isExemptFromBoundCheck?: boolean;
 
-    // Does this type variable originate from new type parameter syntax?
+    // Does this type variable originate from PEP 695 type parameter syntax?
     isTypeParamSyntax?: boolean;
 
     // Used for recursive type aliases.
@@ -2984,6 +2999,11 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
                 return false;
             }
 
+            // If one function is ... and the other is not, they are not the same.
+            if (FunctionType.isGradualCallableForm(type1) !== FunctionType.isGradualCallableForm(functionType2)) {
+                return false;
+            }
+
             const positionOnlyIndex1 = params1.findIndex((param) => isPositionOnlySeparator(param));
             const positionOnlyIndex2 = params2.findIndex((param) => isPositionOnlySeparator(param));
 
@@ -3018,22 +3038,6 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
                 if (!isTypeSame(param1Type, param2Type, { ...options, ignoreTypeFlags: false }, recursionCount)) {
                     return false;
                 }
-            }
-
-            // If the functions have ParamSpecs associated with them, make sure those match.
-            const paramSpec1 = type1.details.paramSpec;
-            const paramSpec2 = functionType2.details.paramSpec;
-
-            if (paramSpec1) {
-                if (!paramSpec2) {
-                    return false;
-                }
-
-                if (!isTypeSame(paramSpec1, paramSpec2, options, recursionCount)) {
-                    return false;
-                }
-            } else if (paramSpec2) {
-                return false;
             }
 
             // Make sure the return types match.
@@ -3493,11 +3497,14 @@ function _addTypeIfUnique(unionType: UnionType, typeToAdd: UnionableType) {
             // If the typeToAdd is a TypedDict that is the same class as the
             // existing type, see if one of them is a proper subset of the other.
             if (ClassType.isTypedDictClass(type) && ClassType.isSameGenericClass(type, typeToAdd)) {
-                if (ClassType.isTypedDictNarrower(typeToAdd, type)) {
-                    return;
-                } else if (ClassType.isTypedDictNarrower(type, typeToAdd)) {
-                    unionType.subtypes[i] = typeToAdd;
-                    return;
+                // Do not proceed if the TypedDicts are generic and have different type arguments.
+                if (!type.typeArguments && !typeToAdd.typeArguments) {
+                    if (ClassType.isTypedDictNarrower(typeToAdd, type)) {
+                        return;
+                    } else if (ClassType.isTypedDictNarrower(type, typeToAdd)) {
+                        unionType.subtypes[i] = typeToAdd;
+                        return;
+                    }
                 }
             }
         }

@@ -29,7 +29,7 @@ import * as AnalyzerNodeInfo from './analyzerNodeInfo';
 import { DeclarationType, VariableDeclaration } from './declaration';
 import * as ParseTreeUtils from './parseTreeUtils';
 import { Symbol, SymbolFlags, SymbolTable } from './symbol';
-import { getLastTypedDeclaredForSymbol } from './symbolUtils';
+import { getLastTypedDeclarationForSymbol } from './symbolUtils';
 import { EvaluatorUsage, FunctionArgument, TypeEvaluator, TypeResult, TypeResultWithNode } from './typeEvaluatorTypes';
 import {
     AnyType,
@@ -113,7 +113,7 @@ export function createTypedDictType(
     classType.details.baseClasses.push(typedDictClass);
     computeMroLinearization(classType);
 
-    const classFields = classType.details.fields;
+    const classFields = ClassType.getSymbolTable(classType);
     classFields.set(
         '__class__',
         Symbol.createWithType(SymbolFlags.ClassMember | SymbolFlags.IgnoredForProtocolMatch, classType)
@@ -196,6 +196,7 @@ export function createTypedDictType(
                 } else if (arg.name.value === 'total' && arg.valueExpression.constType === KeywordType.False) {
                     classType.details.flags |= ClassTypeFlags.CanOmitDictValues;
                 } else if (arg.name.value === 'closed' && arg.valueExpression.constType === KeywordType.True) {
+                    // This is an experimental feature because PEP 728 hasn't been accepted yet.
                     if (AnalyzerNodeInfo.getFileInfo(errorNode).diagnosticRuleSet.enableExperimentalFeatures) {
                         classType.details.flags |=
                             ClassTypeFlags.TypedDictMarkedClosed | ClassTypeFlags.TypedDictEffectivelyClosed;
@@ -234,34 +235,6 @@ export function createTypedDictType(
     return classType;
 }
 
-// Creates a new anonymous TypedDict class from an inlined dict[{}] type annotation.
-export function createTypedDictTypeInlined(
-    evaluator: TypeEvaluator,
-    dictNode: DictionaryNode,
-    typedDictClass: ClassType
-): ClassType {
-    const fileInfo = AnalyzerNodeInfo.getFileInfo(dictNode);
-    const className = '<TypedDict>';
-
-    const classType = ClassType.createInstantiable(
-        className,
-        ParseTreeUtils.getClassFullName(dictNode, fileInfo.moduleName, className),
-        fileInfo.moduleName,
-        fileInfo.fileUri,
-        ClassTypeFlags.TypedDictClass,
-        ParseTreeUtils.getTypeSourceId(dictNode),
-        /* declaredMetaclass */ undefined,
-        typedDictClass.details.effectiveMetaclass
-    );
-    classType.details.baseClasses.push(typedDictClass);
-    computeMroLinearization(classType);
-
-    getTypedDictFieldsFromDictSyntax(evaluator, dictNode, classType.details.fields, /* isInline */ true);
-    synthesizeTypedDictClassMethods(evaluator, dictNode, classType);
-
-    return classType;
-}
-
 export function synthesizeTypedDictClassMethods(
     evaluator: TypeEvaluator,
     node: ClassNode | ExpressionNode,
@@ -279,6 +252,7 @@ export function synthesizeTypedDictClassMethods(
     });
     FunctionType.addDefaultParameters(newType);
     newType.details.declaredReturnType = ClassType.cloneAsInstance(classType);
+    newType.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
 
     // Synthesize an __init__ method with two overrides.
     const initOverride1 = FunctionType.createSynthesizedInstance('__init__', FunctionTypeFlags.Overloaded);
@@ -289,6 +263,7 @@ export function synthesizeTypedDictClassMethods(
         hasDeclaredType: true,
     });
     initOverride1.details.declaredReturnType = evaluator.getNoneType();
+    initOverride1.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
 
     // The first parameter must be positional-only.
     FunctionType.addParameter(initOverride1, {
@@ -310,6 +285,7 @@ export function synthesizeTypedDictClassMethods(
         hasDeclaredType: true,
     });
     initOverride2.details.declaredReturnType = evaluator.getNoneType();
+    initOverride2.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
 
     // All parameters must be named, so insert an empty "*".
     FunctionType.addKeywordOnlyParameterSeparator(initOverride2);
@@ -358,7 +334,7 @@ export function synthesizeTypedDictClassMethods(
         });
     }
 
-    const symbolTable = classType.details.fields;
+    const symbolTable = ClassType.getSymbolTable(classType);
     const initType = OverloadedFunctionType.create([initOverride1, initOverride2]);
     symbolTable.set('__init__', Symbol.createWithType(SymbolFlags.ClassMember, initType));
     symbolTable.set('__new__', Symbol.createWithType(SymbolFlags.ClassMember, newType));
@@ -630,31 +606,27 @@ export function synthesizeTypedDictClassMethods(
             }
         });
 
-        // If the class is closed, we can assume that any other literal
-        // key values will return the default parameter value.
-        if (ClassType.isTypedDictEffectivelyClosed(classType) && isNever(extraEntriesInfo.valueType)) {
-            const literalStringType = evaluator.getTypingType(node, 'LiteralString');
-            if (literalStringType && isInstantiableClass(literalStringType)) {
-                const literalStringInstance = ClassType.cloneAsInstance(literalStringType);
-                getOverloads.push(
-                    createGetMethod(
-                        literalStringInstance,
-                        evaluator.getNoneType(),
-                        /* includeDefault */ false,
-                        /* isEntryRequired */ true
-                    )
-                );
-                getOverloads.push(
-                    createGetMethod(literalStringInstance, /* valueType */ AnyType.create(), /* includeDefault */ true)
-                );
-            }
-        }
-
-        // Provide a final `get` overload that handles the general case where
-        // the key is a str but the literal value isn't known.
         const strType = ClassType.cloneAsInstance(strClass);
-        getOverloads.push(createGetMethod(strType, AnyType.create(), /* includeDefault */ false));
-        getOverloads.push(createGetMethod(strType, AnyType.create(), /* includeDefault */ true));
+
+        // If the class is closed, we can assume that any other keys that
+        // are present will return the default parameter value or the extra
+        // entries value type.
+        if (ClassType.isTypedDictEffectivelyClosed(classType)) {
+            getOverloads.push(
+                createGetMethod(
+                    strType,
+                    combineTypes([extraEntriesInfo.valueType, evaluator.getNoneType()]),
+                    /* includeDefault */ false,
+                    /* isEntryRequired */ true
+                )
+            );
+            getOverloads.push(createGetMethod(strType, extraEntriesInfo.valueType, /* includeDefault */ true));
+        } else {
+            // Provide a final `get` overload that handles the general case where
+            // the key is a str but the literal value isn't known.
+            getOverloads.push(createGetMethod(strType, AnyType.create(), /* includeDefault */ false));
+            getOverloads.push(createGetMethod(strType, AnyType.create(), /* includeDefault */ true));
+        }
 
         symbolTable.set(
             'get',
@@ -994,10 +966,10 @@ function getTypedDictMembersForClassRecursive(
     const typeVarContext = buildTypeVarContextFromSpecializedClass(classType);
 
     // Add any new typed dict entries from this class.
-    classType.details.fields.forEach((symbol, name) => {
+    ClassType.getSymbolTable(classType).forEach((symbol, name) => {
         if (!symbol.isIgnoredForProtocolMatch()) {
             // Only variables (not functions, classes, etc.) are considered.
-            const lastDecl = getLastTypedDeclaredForSymbol(symbol);
+            const lastDecl = getLastTypedDeclarationForSymbol(symbol);
 
             if (lastDecl && lastDecl.type === DeclarationType.Variable) {
                 let valueType = evaluator.getEffectiveTypeOfSymbol(symbol);
@@ -1076,6 +1048,12 @@ export function assignTypedDictToTypedDict(
     const extraSrcEntries = srcEntries.extraItems ?? getEffectiveExtraItemsEntryType(evaluator, srcType);
 
     destEntries.knownItems.forEach((destEntry, name) => {
+        // If we've already determined that the types are inconsistent and
+        // the caller isn't interested in detailed diagnostics, skip the remainder.
+        if (!typesAreConsistent && !diag) {
+            return;
+        }
+
         const srcEntry = srcEntries.knownItems.get(name);
         if (!srcEntry) {
             if (destEntry.isRequired || !destEntry.isReadOnly) {
@@ -1147,6 +1125,12 @@ export function assignTypedDictToTypedDict(
             }
         }
     });
+
+    // If the types are not consistent and the caller isn't interested
+    // in detailed diagnostics, don't do additional work.
+    if (!typesAreConsistent && !diag) {
+        return false;
+    }
 
     // If the destination TypedDict is closed, check any extra entries in the source
     // TypedDict to ensure that they don't violate the "extra items" type.
@@ -1454,14 +1438,12 @@ export function getTypeOfIndexedTypedDict(
                 allDiagsInvolveNotRequiredKeys = false;
                 return UnknownType.create();
             } else if (!(entry.isRequired || entry.isProvided) && usage.method === 'get') {
-                if (!ParseTreeUtils.isWithinTryBlock(node, /* treatWithAsTryBlock */ true)) {
-                    diag.addMessage(
-                        LocAddendum.keyNotRequired().format({
-                            name: entryName,
-                            type: evaluator.printType(baseType),
-                        })
-                    );
-                }
+                diag.addMessage(
+                    LocAddendum.keyNotRequired().format({
+                        name: entryName,
+                        type: evaluator.printType(baseType),
+                    })
+                );
             } else if (entry.isReadOnly && usage.method !== 'get') {
                 diag.addMessage(
                     LocAddendum.keyReadOnly().format({

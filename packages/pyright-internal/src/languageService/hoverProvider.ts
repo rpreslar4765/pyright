@@ -17,11 +17,11 @@ import {
     VariableDeclaration,
     isUnresolvedAliasDeclaration,
 } from '../analyzer/declaration';
-import { convertDocStringToMarkdown, convertDocStringToPlainText } from '../analyzer/docStringConversion';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { SourceMapper } from '../analyzer/sourceMapper';
+import { isBuiltInModule } from '../analyzer/typeDocStringUtils';
 import { PrintTypeOptions, TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
-import { doForEachSubtype, isMaybeDescriptorInstance } from '../analyzer/typeUtils';
+import { convertToInstance, doForEachSubtype, isMaybeDescriptorInstance } from '../analyzer/typeUtils';
 import {
     ClassType,
     Type,
@@ -39,10 +39,11 @@ import { SignatureDisplayType } from '../common/configOptions';
 import { assertNever, fail } from '../common/debug';
 import { ProgramView } from '../common/extensibility';
 import { convertOffsetToPosition, convertPositionToOffset } from '../common/positionUtils';
+import { ServiceProvider } from '../common/serviceProvider';
 import { Position, Range, TextRange } from '../common/textRange';
 import { Uri } from '../common/uri/uri';
 import { ExpressionNode, NameNode, ParseNode, ParseNodeType, StringNode } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import {
     getClassAndConstructorTypes,
     getConstructorTooltip,
@@ -91,13 +92,21 @@ export function convertHoverResults(hoverResults: HoverResults | null, format: M
     };
 }
 
-export function addDocumentationResultsPart(docString: string | undefined, format: MarkupKind, parts: HoverTextPart[]) {
+export function addDocumentationResultsPart(
+    serviceProvider: ServiceProvider,
+    docString: string | undefined,
+    format: MarkupKind,
+    parts: HoverTextPart[],
+    resolvedDecl: Declaration | undefined
+) {
     if (!docString) {
         return;
     }
 
     if (format === MarkupKind.Markdown) {
-        const markDown = convertDocStringToMarkdown(docString);
+        const markDown = serviceProvider
+            .docStringService()
+            .convertDocStringToMarkdown(docString, isBuiltInModule(resolvedDecl?.uri));
 
         if (parts.length > 0 && markDown.length > 0) {
             parts.push({ text: '---\n' });
@@ -108,7 +117,7 @@ export function addDocumentationResultsPart(docString: string | undefined, forma
     }
 
     if (format === MarkupKind.PlainText) {
-        parts.push({ text: convertDocStringToPlainText(docString), python: false });
+        parts.push({ text: serviceProvider.docStringService().convertDocStringToPlainText(docString), python: false });
         return;
     }
 
@@ -125,8 +134,9 @@ export function getVariableTypeText(
 ) {
     let label = declaration.isConstant || evaluator.isFinalVariableDeclaration(declaration) ? 'constant' : 'variable';
 
-    let expandTypeAlias = false;
+    const expandTypeAlias = false;
     let typeVarName: string | undefined;
+
     if (type.typeAliasInfo && typeNode.nodeType === ParseNodeType.Name) {
         const typeAliasInfo = getTypeAliasInfo(type);
         if (typeAliasInfo?.name === typeNode.value) {
@@ -134,8 +144,12 @@ export function getVariableTypeText(
                 label = type.details.isParamSpec ? 'param spec' : 'type variable';
                 typeVarName = type.details.name;
             } else {
-                expandTypeAlias = true;
-                label = 'type alias';
+                // Handle type aliases specially.
+                const typeText = evaluator.printType(convertToInstance(getTypeForToolTip(evaluator, typeNode)), {
+                    expandTypeAlias: true,
+                });
+
+                return `(type) ${name} = ` + typeText;
             }
         }
     }
@@ -146,13 +160,13 @@ export function getVariableTypeText(
     }
 
     const typeText =
-        typeVarName || name + ': ' + evaluator.printType(getTypeForToolTip(evaluator, typeNode), { expandTypeAlias });
+        typeVarName ?? name + ': ' + evaluator.printType(getTypeForToolTip(evaluator, typeNode), { expandTypeAlias });
 
     return `(${label}) ` + typeText;
 }
 
 export class HoverProvider {
-    private readonly _parseResults: ParseResults | undefined;
+    private readonly _parseResults: ParseFileResults | undefined;
     private readonly _sourceMapper: SourceMapper;
 
     constructor(
@@ -214,7 +228,7 @@ export class HoverProvider {
             return null;
         }
 
-        const node = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, offset);
+        const node = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, offset);
         if (node === undefined) {
             return null;
         }
@@ -403,8 +417,9 @@ export class HoverProvider {
             }
 
             case DeclarationType.TypeAlias: {
-                const typeText = node.value + this._getTypeText(node, { expandTypeAlias: true });
-                this._addResultsPart(parts, `(type alias) ${typeText}`, /* python */ true);
+                const type = convertToInstance(this._getType(node));
+                const typeText = this._evaluator.printType(type, { expandTypeAlias: true });
+                this._addResultsPart(parts, `(type) ${node.value} = ${typeText}`, /* python */ true);
                 this._addDocumentationPart(parts, node, resolvedDecl);
                 break;
             }
@@ -431,7 +446,7 @@ export class HoverProvider {
                     const text = '(key) ' + node.value + ': ' + this._evaluator.printType(entry.valueType);
                     this._addResultsPart(parts, text, /* python */ true);
 
-                    const declarations = subtype.details.fields.get(node.value)?.getDeclarations();
+                    const declarations = ClassType.getSymbolTable(subtype).get(node.value)?.getDeclarations();
                     if (declarations !== undefined && declarations?.length !== 0) {
                         // As we are just interested in the docString we don't have to worry about
                         // anything other than the first declaration. There also shouldn't be more
@@ -495,7 +510,7 @@ export class HoverProvider {
             name,
         });
 
-        addDocumentationResultsPart(docString, this._format, parts);
+        addDocumentationResultsPart(this._program.serviceProvider, docString, this._format, parts, resolvedDecl);
         return !!docString;
     }
 

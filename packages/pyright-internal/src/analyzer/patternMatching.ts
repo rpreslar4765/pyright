@@ -29,9 +29,8 @@ import {
     PatternValueNode,
 } from '../parser/parseNodes';
 import { CodeFlowReferenceExpressionNode } from './codeFlowTypes';
-import { populateTypeVarContextBasedOnExpectedType } from './constraintSolver';
+import { addConstraintsForExpectedType } from './constraintSolver';
 import { getTypeVarScopesForNode, isMatchingExpression } from './parseTreeUtils';
-import { getTypedDictMembersForClass } from './typedDicts';
 import { EvaluatorFlags, TypeEvaluator, TypeResult } from './typeEvaluatorTypes';
 import {
     enumerateLiteralsForType,
@@ -39,25 +38,6 @@ import {
     narrowTypeForDiscriminatedLiteralFieldComparison,
     narrowTypeForDiscriminatedTupleComparison,
 } from './typeGuards';
-import {
-    AnyType,
-    ClassType,
-    combineTypes,
-    isAnyOrUnknown,
-    isClass,
-    isClassInstance,
-    isInstantiableClass,
-    isNever,
-    isSameWithoutLiteralValue,
-    isTypeSame,
-    isUnknown,
-    isUnpackedVariadicTypeVar,
-    NeverType,
-    Type,
-    TypeBase,
-    TypedDictEntry,
-    UnknownType,
-} from './types';
 import {
     addConditionToType,
     applySolvedTypeVars,
@@ -78,11 +58,33 @@ import {
     mapSubtypes,
     partiallySpecializeType,
     preserveUnknown,
-    specializeClassType,
     specializeTupleClass,
+    specializeWithUnknownTypeArgs,
     transformPossibleRecursiveTypeAlias,
 } from './typeUtils';
 import { TypeVarContext } from './typeVarContext';
+import { getTypedDictMembersForClass } from './typedDicts';
+import {
+    AnyType,
+    ClassType,
+    FunctionType,
+    FunctionTypeFlags,
+    NeverType,
+    Type,
+    TypeBase,
+    TypedDictEntry,
+    UnknownType,
+    combineTypes,
+    isAnyOrUnknown,
+    isClass,
+    isClassInstance,
+    isInstantiableClass,
+    isNever,
+    isSameWithoutLiteralValue,
+    isTypeSame,
+    isUnknown,
+    isUnpackedVariadicTypeVar,
+} from './types';
 
 // PEP 634 indicates that several built-in classes are handled differently
 // when used with class pattern matching.
@@ -217,9 +219,20 @@ function narrowTypeBasedOnSequencePattern(
         let canNarrowTuple = entry.isTuple;
 
         // Don't attempt to narrow tuples in the negative case if the subject
-        // contains indeterminate-length entries.
-        if (!isPositiveTest && entry.isIndeterminateLength) {
-            canNarrowTuple = false;
+        // contains indeterminate-length entries or the tuple is of indeterminate
+        // length.
+        if (!isPositiveTest) {
+            if (entry.isIndeterminateLength) {
+                canNarrowTuple = false;
+            }
+
+            if (
+                isClassInstance(entry.subtype) &&
+                entry.subtype.tupleTypeArguments &&
+                entry.subtype.tupleTypeArguments.some((typeArg) => typeArg.isUnbounded)
+            ) {
+                canNarrowTuple = false;
+            }
         }
 
         // If the subject has an indeterminate length but the pattern does not accept
@@ -291,9 +304,15 @@ function narrowTypeBasedOnSequencePattern(
             }
         });
 
-        // If the pattern is an empty sequence, use the entry types.
-        if (pattern.entries.length === 0 && entry.entryTypes.length > 0) {
-            narrowedEntryTypes.push(combineTypes(entry.entryTypes));
+        if (pattern.entries.length === 0) {
+            // If the pattern is an empty sequence, use the entry types.
+            if (entry.entryTypes.length > 0) {
+                narrowedEntryTypes.push(combineTypes(entry.entryTypes));
+            }
+
+            if (entry.isPotentialNoMatch) {
+                isDefiniteMatch = false;
+            }
         }
 
         if (!isPositiveTest) {
@@ -666,7 +685,7 @@ function narrowTypeBasedOnClassPattern(
     // specialize it with Unknown type arguments.
     if (isClass(exprType) && !exprType.typeAliasInfo) {
         exprType = ClassType.cloneRemoveTypePromotions(exprType);
-        exprType = specializeClassType(exprType);
+        exprType = specializeWithUnknownTypeArgs(exprType, evaluator.getTupleClassType());
     }
 
     // Are there any positional arguments? If so, try to get the mappings for
@@ -712,10 +731,22 @@ function narrowTypeBasedOnClassPattern(
                     return subjectSubtypeExpanded;
                 }
 
+                // Handle Callable specially.
+                if (
+                    !isAnyOrUnknown(subjectSubtypeExpanded) &&
+                    isInstantiableClass(classType) &&
+                    ClassType.isBuiltIn(classType, 'Callable')
+                ) {
+                    if (evaluator.assignType(getUnknownTypeForCallable(), subjectSubtypeExpanded)) {
+                        return undefined;
+                    }
+                }
+
                 if (!isNoneInstance(subjectSubtypeExpanded) && !isClassInstance(subjectSubtypeExpanded)) {
                     return subjectSubtypeUnexpanded;
                 }
 
+                // Handle NoneType specially.
                 if (
                     isNoneInstance(subjectSubtypeExpanded) &&
                     isInstantiableClass(classType) &&
@@ -730,29 +761,24 @@ function narrowTypeBasedOnClassPattern(
 
                 if (pattern.arguments.length === 0) {
                     if (isClass(classInstance) && isClass(subjectSubtypeExpanded)) {
-                        if (ClassType.isDerivedFrom(subjectSubtypeExpanded, classInstance)) {
-                            // We know that this match will always succeed, so we can
-                            // eliminate this subtype.
-                            return undefined;
-                        }
-
-                        // Handle LiteralString as a special case.
-                        if (
-                            ClassType.isBuiltIn(classInstance, 'str') &&
-                            ClassType.isBuiltIn(subjectSubtypeExpanded, 'LiteralString')
-                        ) {
-                            return undefined;
-                        }
+                        // We know that this match will always succeed, so we can
+                        // eliminate this subtype.
+                        return undefined;
                     }
 
                     return subjectSubtypeExpanded;
                 }
 
                 // We might be able to narrow further based on arguments, but only
-                // if the types match exactly or the subtype is a final class and
-                // therefore cannot be subclassed.
+                // if the types match exactly, the subject subtype is a final class (and
+                // therefore cannot be subclassed), or the pattern class is a protocol
+                // class.
                 if (!evaluator.assignType(subjectSubtypeExpanded, classInstance)) {
-                    if (isClass(subjectSubtypeExpanded) && !ClassType.isFinal(subjectSubtypeExpanded)) {
+                    if (
+                        isClass(subjectSubtypeExpanded) &&
+                        !ClassType.isFinal(subjectSubtypeExpanded) &&
+                        !ClassType.isProtocolClass(classInstance)
+                    ) {
                         return subjectSubtypeExpanded;
                     }
                 }
@@ -785,6 +811,16 @@ function narrowTypeBasedOnClassPattern(
             pattern.className
         );
         return NeverType.createNever();
+    } else if (
+        isInstantiableClass(exprType) &&
+        ClassType.isProtocolClass(exprType) &&
+        !ClassType.isRuntimeCheckable(exprType)
+    ) {
+        evaluator.addDiagnostic(
+            DiagnosticRule.reportGeneralTypeIssues,
+            LocAddendum.protocolRequiresRuntimeCheckable(),
+            pattern.className
+        );
     }
 
     return evaluator.mapSubtypesExpandTypeVars(
@@ -801,6 +837,20 @@ function narrowTypeBasedOnClassPattern(
 
                 return evaluator.mapSubtypesExpandTypeVars(type, /* options */ undefined, (subjectSubtypeExpanded) => {
                     if (isAnyOrUnknown(subjectSubtypeExpanded)) {
+                        if (isInstantiableClass(expandedSubtype) && ClassType.isBuiltIn(expandedSubtype, 'Callable')) {
+                            // Convert to an unknown callable type.
+                            const unknownCallable = FunctionType.createSynthesizedInstance(
+                                '',
+                                FunctionTypeFlags.GradualCallableForm
+                            );
+                            FunctionType.addDefaultParameters(
+                                unknownCallable,
+                                /* useUnknown */ isUnknown(subjectSubtypeExpanded)
+                            );
+                            unknownCallable.details.declaredReturnType = subjectSubtypeExpanded;
+                            return unknownCallable;
+                        }
+
                         return convertToInstance(unexpandedSubtype);
                     }
 
@@ -871,7 +921,7 @@ function narrowTypeBasedOnClassPattern(
 
                                     const matchTypeInstance = ClassType.cloneAsInstance(unspecializedMatchType);
                                     if (
-                                        populateTypeVarContextBasedOnExpectedType(
+                                        addConstraintsForExpectedType(
                                             evaluator,
                                             matchTypeInstance,
                                             subjectSubtypeExpanded,
@@ -882,6 +932,7 @@ function narrowTypeBasedOnClassPattern(
                                     ) {
                                         resultType = applySolvedTypeVars(matchTypeInstance, typeVarContext, {
                                             unknownIfNotFound: true,
+                                            tupleClassType: evaluator.getTupleClassType(),
                                         }) as ClassType;
                                     }
                                 }
@@ -1275,7 +1326,7 @@ function getSequencePatternInfo(
                             typeArgs.splice(tupleIndeterminateIndex, 0, typeArgs[tupleIndeterminateIndex]);
                         }
 
-                        if (typeArgs.length > patternEntryCount) {
+                        if (typeArgs.length > patternEntryCount && patternStarEntryIndex === undefined) {
                             typeArgs.splice(tupleIndeterminateIndex, 1);
                         }
                     }
@@ -1404,7 +1455,7 @@ function getSequencePatternInfo(
             if (sequenceType && isInstantiableClass(sequenceType)) {
                 const sequenceTypeVarContext = new TypeVarContext(getTypeVarScopeId(sequenceType));
                 if (
-                    populateTypeVarContextBasedOnExpectedType(
+                    addConstraintsForExpectedType(
                         evaluator,
                         ClassType.cloneAsInstance(sequenceType),
                         subtype,
@@ -1550,7 +1601,11 @@ export function assignTypeToPatternTargets(
 
         case ParseNodeType.PatternAs: {
             if (pattern.target) {
-                evaluator.assignTypeToExpression(pattern.target, narrowedType, isTypeIncomplete, pattern.target);
+                evaluator.assignTypeToExpression(
+                    pattern.target,
+                    { type: narrowedType, isIncomplete: isTypeIncomplete },
+                    pattern.target
+                );
             }
 
             let runningNarrowedType = narrowedType;
@@ -1594,7 +1649,11 @@ export function assignTypeToPatternTargets(
                     }
                 }
             } else {
-                evaluator.assignTypeToExpression(pattern.target, narrowedType, isTypeIncomplete, pattern.target);
+                evaluator.assignTypeToExpression(
+                    pattern.target,
+                    { type: narrowedType, isIncomplete: isTypeIncomplete },
+                    pattern.target
+                );
             }
             break;
         }
@@ -1682,8 +1741,7 @@ export function assignTypeToPatternTargets(
                             : UnknownType.create();
                     evaluator.assignTypeToExpression(
                         mappingEntry.target,
-                        dictType,
-                        isTypeIncomplete,
+                        { type: dictType, isIncomplete: isTypeIncomplete },
                         mappingEntry.target
                     );
                 }
@@ -1947,6 +2005,8 @@ export function getPatternSubtypeNarrowingCallback(
                         subtype.tupleTypeArguments.every((e) => !e.isUnbounded)
                     ) {
                         narrowedSubtypes.push(subtype.tupleTypeArguments[matchingEntryIndex].type);
+                    } else if (isNever(narrowedSubjectType)) {
+                        narrowedSubtypes.push(narrowedSubjectType);
                     } else {
                         canNarrow = false;
                     }

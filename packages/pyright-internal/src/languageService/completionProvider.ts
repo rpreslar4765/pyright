@@ -29,24 +29,24 @@ import {
     VariableDeclaration,
 } from '../analyzer/declaration';
 import { isDefinedInFile } from '../analyzer/declarationUtils';
-import { convertDocStringToMarkdown, convertDocStringToPlainText } from '../analyzer/docStringConversion';
 import { ImportedModuleDescriptor, ImportResolver } from '../analyzer/importResolver';
 import { ImportResult } from '../analyzer/importResult';
-import { getParameterListDetails, ParameterSource } from '../analyzer/parameterUtils';
+import { getParameterListDetails, ParameterKind } from '../analyzer/parameterUtils';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { getCallNodeAndActiveParameterIndex } from '../analyzer/parseTreeUtils';
 import { getScopeForNode } from '../analyzer/scopeUtils';
 import { isStubFile, SourceMapper } from '../analyzer/sourceMapper';
 import { Symbol, SymbolTable } from '../analyzer/symbol';
 import * as SymbolNameUtils from '../analyzer/symbolNameUtils';
-import { getLastTypedDeclaredForSymbol, isVisibleExternally } from '../analyzer/symbolUtils';
+import { getLastTypedDeclarationForSymbol, isVisibleExternally } from '../analyzer/symbolUtils';
 import { getTypedDictMembersForClass } from '../analyzer/typedDicts';
-import { getModuleDocStringFromUris } from '../analyzer/typeDocStringUtils';
+import { getModuleDocStringFromUris, isBuiltInModule } from '../analyzer/typeDocStringUtils';
 import { CallSignatureInfo, TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
 import { printLiteralValue } from '../analyzer/typePrinter';
 import {
     ClassType,
     combineTypes,
+    EnumLiteral,
     FunctionType,
     isClass,
     isClassInstance,
@@ -108,7 +108,7 @@ import {
     StringNode,
     TypeAnnotationNode,
 } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import {
     FStringStartToken,
     OperatorToken,
@@ -127,6 +127,8 @@ import {
 } from './completionProviderUtils';
 import { DocumentSymbolCollector } from './documentSymbolCollector';
 import { getAutoImportText, getDocumentationPartsForTypeAndDecl } from './tooltipUtils';
+import '../common/serviceProviderExtensions';
+import { transformTypeForEnumMember } from '../analyzer/enums';
 
 namespace Keywords {
     const base: string[] = [
@@ -278,7 +280,7 @@ export class CompletionProvider {
     private _stringLiteralContainer: StringToken | FStringStartToken | undefined = undefined;
 
     protected readonly execEnv: ExecutionEnvironment;
-    protected readonly parseResults: ParseResults;
+    protected readonly parseResults: ParseFileResults;
     protected readonly sourceMapper: SourceMapper;
 
     // If we're being asked to resolve a completion item, we run the
@@ -348,25 +350,27 @@ export class CompletionProvider {
         if (
             completionItemData.moduleUri &&
             ImportResolver.isSupportedImportSourceFile(
-                Uri.parse(completionItemData.moduleUri, this.importResolver.fileSystem.isCaseSensitive)
+                Uri.parse(completionItemData.moduleUri, this.program.serviceProvider)
             )
         ) {
-            const documentation = getModuleDocStringFromUris(
-                [Uri.parse(completionItemData.moduleUri, this.importResolver.fileSystem.isCaseSensitive)],
-                this.sourceMapper
-            );
+            const moduleUri = Uri.parse(completionItemData.moduleUri, this.program.serviceProvider);
+            const documentation = getModuleDocStringFromUris([moduleUri], this.sourceMapper);
             if (!documentation) {
                 return;
             }
 
             if (this.options.format === MarkupKind.Markdown) {
-                const markdownString = convertDocStringToMarkdown(documentation);
+                const markdownString = this.program.serviceProvider
+                    .docStringService()
+                    .convertDocStringToMarkdown(documentation, isBuiltInModule(moduleUri));
                 completionItem.documentation = {
                     kind: MarkupKind.Markdown,
                     value: markdownString,
                 };
             } else if (this.options.format === MarkupKind.PlainText) {
-                const plainTextString = convertDocStringToPlainText(documentation);
+                const plainTextString = this.program.serviceProvider
+                    .docStringService()
+                    .convertDocStringToPlainText(documentation);
                 completionItem.documentation = {
                     kind: MarkupKind.PlainText,
                     value: plainTextString,
@@ -405,30 +409,6 @@ export class CompletionProvider {
         return this.program.configOptions;
     }
 
-    protected isSimpleDefault(node: ExpressionNode): boolean {
-        switch (node.nodeType) {
-            case ParseNodeType.Number:
-            case ParseNodeType.Constant:
-            case ParseNodeType.MemberAccess:
-                return true;
-
-            case ParseNodeType.String:
-                return (node.token.flags & StringTokenFlags.Format) === 0;
-
-            case ParseNodeType.StringList:
-                return node.strings.every(this.isSimpleDefault);
-
-            case ParseNodeType.UnaryOperation:
-                return this.isSimpleDefault(node.expression);
-
-            case ParseNodeType.BinaryOperation:
-                return this.isSimpleDefault(node.leftExpression) && this.isSimpleDefault(node.rightExpression);
-
-            default:
-                return false;
-        }
-    }
-
     protected getMethodOverrideCompletions(
         priorWord: string,
         partialName: NameNode,
@@ -452,13 +432,13 @@ export class CompletionProvider {
             }
         }
 
-        const staticmethod = decorators?.some((d) => this.checkDecorator(d, 'staticmethod')) ?? false;
-        const classmethod = decorators?.some((d) => this.checkDecorator(d, 'classmethod')) ?? false;
+        const staticmethod = decorators?.some((d) => ParseTreeUtils.checkDecorator(d, 'staticmethod')) ?? false;
+        const classmethod = decorators?.some((d) => ParseTreeUtils.checkDecorator(d, 'classmethod')) ?? false;
 
         const completionMap = new CompletionMap();
 
         symbolTable.forEach((symbol, name) => {
-            let decl = getLastTypedDeclaredForSymbol(symbol);
+            let decl = getLastTypedDeclarationForSymbol(symbol);
             if (decl && decl.type === DeclarationType.Function) {
                 if (StringUtils.isPatternInSymbol(partialName.value, name)) {
                     const declaredType = this.evaluator.getTypeForDeclaration(decl)?.type;
@@ -636,7 +616,7 @@ export class CompletionProvider {
         // Make sure we don't crash due to OOM.
         this.program.handleMemoryHighUsage();
 
-        let primaryDecl = getLastTypedDeclaredForSymbol(symbol);
+        let primaryDecl = getLastTypedDeclarationForSymbol(symbol);
         if (!primaryDecl) {
             const declarations = symbol.getDeclarations();
             if (declarations.length > 0) {
@@ -707,9 +687,11 @@ export class CompletionProvider {
 
             if (this.options.format === MarkupKind.Markdown || this.options.format === MarkupKind.PlainText) {
                 this.itemToResolve.documentation = getCompletionItemDocumentation(
+                    this.program.serviceProvider,
                     typeDetail,
                     documentation,
-                    this.options.format
+                    this.options.format,
+                    primaryDecl
                 );
             } else {
                 fail(`Unsupported markup type: ${this.options.format}`);
@@ -725,13 +707,7 @@ export class CompletionProvider {
             // Handle enum members specially. Enum members normally look like
             // variables, but the are declared using assignment expressions
             // within an enum class.
-            if (
-                primaryDecl.type === DeclarationType.Variable &&
-                detail.boundObjectOrClass &&
-                isInstantiableClass(detail.boundObjectOrClass) &&
-                ClassType.isEnumClass(detail.boundObjectOrClass) &&
-                primaryDecl.node.parent?.nodeType === ParseNodeType.Assignment
-            ) {
+            if (this._isEnumMember(detail.boundObjectOrClass, name)) {
                 itemKind = CompletionItemKind.EnumMember;
             }
 
@@ -777,19 +753,16 @@ export class CompletionProvider {
 
             if (isClass(subtype)) {
                 const instance = TypeBase.isInstance(subtype);
-                if (ClassType.isEnumClass(subtype) && instance) {
-                    // We don't add members for instances of enum members, but do add members of `enum.Enum` itself.
-                    // ex) 'MyEnum.member.' <= here
-                    const enumType = subtype.details.baseClasses.find(
-                        (t) => isClass(t) && ClassType.isBuiltIn(t, 'Enum')
-                    ) as ClassType | undefined;
-                    if (!enumType) {
-                        return;
-                    }
+                getMembersForClass(subtype, symbolTable, instance);
 
-                    getMembersForClass(enumType, symbolTable, /* instance */ true);
-                } else {
-                    getMembersForClass(subtype, symbolTable, instance);
+                if (ClassType.isEnumClass(subtype) && instance) {
+                    // Don't show enum member out of another enum member
+                    // ex) Enum.Member. <= shouldn't show `Member` again.
+                    for (const name of symbolTable.keys()) {
+                        if (this._isEnumMember(subtype, name)) {
+                            symbolTable.delete(name);
+                        }
+                    }
                 }
             } else if (isModule(subtype)) {
                 getMembersForModule(subtype, symbolTable);
@@ -838,6 +811,7 @@ export class CompletionProvider {
 
         const autoImporter = new AutoImporter(
             this.execEnv,
+            this.program,
             this.importResolver,
             this.parseResults,
             this.position,
@@ -891,10 +865,6 @@ export class CompletionProvider {
                 );
             }
         }
-    }
-
-    protected checkDecorator(node: DecoratorNode, value: string): boolean {
-        return node.expression.nodeType === ParseNodeType.Name && node.expression.value === value;
     }
 
     protected addExtraCommitChar(item: CompletionItem) {
@@ -994,7 +964,9 @@ export class CompletionProvider {
 
             if (detail?.documentation) {
                 markdownString += '---\n';
-                markdownString += convertDocStringToMarkdown(detail.documentation);
+                markdownString += this.program.serviceProvider
+                    .docStringService()
+                    .convertDocStringToMarkdown(detail.documentation, isBuiltInModule(detail.moduleUri));
             }
 
             markdownString = markdownString.trimEnd();
@@ -1021,7 +993,9 @@ export class CompletionProvider {
             }
 
             if (detail?.documentation) {
-                plainTextString += '\n' + convertDocStringToPlainText(detail.documentation);
+                plainTextString +=
+                    '\n' +
+                    this.program.serviceProvider.docStringService().convertDocStringToPlainText(detail.documentation);
             }
 
             plainTextString = plainTextString.trimEnd();
@@ -1087,7 +1061,7 @@ export class CompletionProvider {
             return undefined;
         }
 
-        let node = ParseTreeUtils.findNodeByOffset(this.parseResults.parseTree, offset);
+        let node = ParseTreeUtils.findNodeByOffset(this.parseResults.parserOutput.parseTree, offset);
 
         // See if we're inside a string literal or an f-string statement.
         const token = ParseTreeUtils.getTokenOverlapping(this.parseResults.tokenizerOutput.tokens, offset);
@@ -1130,7 +1104,7 @@ export class CompletionProvider {
                     sawComma = true;
                 }
 
-                const curNode = ParseTreeUtils.findNodeByOffset(this.parseResults.parseTree, curOffset);
+                const curNode = ParseTreeUtils.findNodeByOffset(this.parseResults.parserOutput.parseTree, curOffset);
                 if (curNode && curNode !== initialNode) {
                     if (ParseTreeUtils.getNodeDepth(curNode) > initialDepth) {
                         node = curNode;
@@ -1257,7 +1231,7 @@ export class CompletionProvider {
             }
 
             if (curNode.nodeType === ParseNodeType.ImportFrom) {
-                return this._getImportFromCompletions(curNode, priorWord);
+                return this._getImportFromCompletions(curNode, offset, priorWord);
             }
 
             if (isExpressionNode(curNode)) {
@@ -1315,10 +1289,9 @@ export class CompletionProvider {
         return undefined;
     }
 
-    // This method will return false if it wants1
-    // caller to walk up the tree. it will return
-    // CompletionResults or undefined if it wants caller
-    // to return.
+    // This method returns false if it wants the caller to walk up the
+    // tree. It returns CompletionResults or undefined if it wants the
+    // caller to return.
     private _tryGetNameCompletions(
         curNode: NameNode,
         offset: number,
@@ -1365,10 +1338,10 @@ export class CompletionProvider {
                 }
 
                 if (curNode.parent.name === curNode) {
-                    return this._getImportFromCompletions(parentNode, priorWord);
+                    return this._getImportFromCompletions(parentNode, offset, priorWord);
                 }
 
-                return this._getImportFromCompletions(parentNode, '');
+                return this._getImportFromCompletions(parentNode, offset, '');
             }
 
             return false;
@@ -1406,7 +1379,7 @@ export class CompletionProvider {
         }
 
         if (
-            curNode.parent.nodeType === ParseNodeType.ListComprehensionFor &&
+            curNode.parent.nodeType === ParseNodeType.ComprehensionFor &&
             TextRange.contains(curNode.parent.targetExpression, curNode.start)
         ) {
             return undefined;
@@ -1552,7 +1525,10 @@ export class CompletionProvider {
                     }
 
                     const previousOffset = TextRange.getEnd(prevToken);
-                    const previousNode = ParseTreeUtils.findNodeByOffset(this.parseResults.parseTree, previousOffset);
+                    const previousNode = ParseTreeUtils.findNodeByOffset(
+                        this.parseResults.parserOutput.parseTree,
+                        previousOffset
+                    );
                     if (
                         previousNode?.nodeType !== ParseNodeType.Error ||
                         previousNode.category !== ErrorExpressionCategory.MissingMemberAccessName
@@ -1616,7 +1592,7 @@ export class CompletionProvider {
     }
 
     private _isOverload(node: DecoratorNode): boolean {
-        return this.checkDecorator(node, 'overload');
+        return ParseTreeUtils.checkDecorator(node, 'overload');
     }
 
     private _createSingleKeywordCompletion(keyword: string): CompletionMap {
@@ -1787,7 +1763,7 @@ export class CompletionProvider {
 
         const enclosingFunc = ParseTreeUtils.getEnclosingFunction(partialName);
         symbolTable.forEach((symbol, name) => {
-            const decl = getLastTypedDeclaredForSymbol(symbol);
+            const decl = getLastTypedDeclarationForSymbol(symbol);
             if (!decl || decl.type !== DeclarationType.Function) {
                 return;
             }
@@ -1883,7 +1859,7 @@ export class CompletionProvider {
                 if (param.defaultValue) {
                     paramString += paramTypeAnnotation ? ' = ' : '=';
 
-                    const useEllipsis = ellipsisForDefault ?? !this.isSimpleDefault(param.defaultValue);
+                    const useEllipsis = ellipsisForDefault ?? !ParseTreeUtils.isSimpleDefault(param.defaultValue);
                     paramString += useEllipsis ? '...' : ParseTreeUtils.printExpression(param.defaultValue, printFlags);
                 }
 
@@ -2221,7 +2197,7 @@ export class CompletionProvider {
 
         let startingNode: ParseNode = indexNode.baseExpression;
         if (declaration.node) {
-            const scopeRoot = ParseTreeUtils.getEvaluationScopeNode(declaration.node);
+            const scopeRoot = ParseTreeUtils.getEvaluationScopeNode(declaration.node).node;
 
             // Find the lowest tree to search the symbol.
             if (
@@ -2744,7 +2720,11 @@ export class CompletionProvider {
         completionMap.set(completionItem);
     }
 
-    private _getImportFromCompletions(importFromNode: ImportFromNode, priorWord: string): CompletionMap | undefined {
+    private _getImportFromCompletions(
+        importFromNode: ImportFromNode,
+        offset: number,
+        priorWord: string
+    ): CompletionMap | undefined {
         // Don't attempt to provide completions for "from X import *".
         if (importFromNode.isWildcardImport) {
             return undefined;
@@ -2770,7 +2750,7 @@ export class CompletionProvider {
             return completionMap;
         }
 
-        const symbolTable = AnalyzerNodeInfo.getScope(parseResults.parseTree)?.symbolTable;
+        const symbolTable = AnalyzerNodeInfo.getScope(parseResults.parserOutput.parseTree)?.symbolTable;
         if (!symbolTable) {
             return completionMap;
         }
@@ -2778,10 +2758,16 @@ export class CompletionProvider {
         this._addSymbolsForSymbolTable(
             symbolTable,
             (symbol, name) => {
-                // Don't suggest built in symbols or ones that have already been imported.
                 return (
+                    // Don't suggest built in symbols.
                     symbol.getDeclarations().some((d) => !isIntrinsicDeclaration(d)) &&
-                    !importFromNode.imports.find((imp) => imp.name.value === name)
+                    // Don't suggest symbols that have already been imported elsewhere
+                    // in this import statement.
+                    !importFromNode.imports.find(
+                        (imp) =>
+                            imp.name.value === name &&
+                            !(TextRange.contains(imp, offset) || TextRange.getEnd(imp) === offset)
+                    )
                 );
             },
             priorWord,
@@ -2871,7 +2857,7 @@ export class CompletionProvider {
         const paramDetails = getParameterListDetails(type);
 
         paramDetails.params.forEach((paramInfo) => {
-            if (paramInfo.param.name && paramInfo.source !== ParameterSource.PositionOnly) {
+            if (paramInfo.param.name && paramInfo.kind !== ParameterKind.Positional) {
                 if (!SymbolNameUtils.isPrivateOrProtectedName(paramInfo.param.name)) {
                     names.add(paramInfo.param.name);
                 }
@@ -2906,7 +2892,7 @@ export class CompletionProvider {
                         classType.classType.details.mro.forEach((baseClass, index) => {
                             if (isInstantiableClass(baseClass)) {
                                 this._addSymbolsForSymbolTable(
-                                    baseClass.details.fields,
+                                    ClassType.getSymbolTable(baseClass),
                                     (symbol) => {
                                         if (!symbol.isClassMember()) {
                                             return false;
@@ -3149,6 +3135,21 @@ export class CompletionProvider {
         // Do cheap check using only nodes that will cover 99.9% cases
         // before doing more expensive type evaluation.
         return decl.isMethod && decl.node.decorators.length > 0;
+    }
+
+    private _isEnumMember(containingType: ClassType | undefined, name: string) {
+        if (!containingType || !ClassType.isEnumClass(containingType)) {
+            return false;
+        }
+
+        const symbolType = transformTypeForEnumMember(this.evaluator, containingType, name);
+
+        return (
+            symbolType &&
+            isClassInstance(symbolType) &&
+            ClassType.isSameGenericClass(symbolType, containingType) &&
+            symbolType.literalValue instanceof EnumLiteral
+        );
     }
 }
 

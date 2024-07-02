@@ -9,7 +9,13 @@
 import { CancellationToken } from 'vscode-languageserver';
 import { MessageChannel, MessagePort, Worker, parentPort, threadId, workerData } from 'worker_threads';
 
-import { AnalysisCompleteCallback, AnalysisResults, analyzeProgram, nullCallback } from './analyzer/analysis';
+import {
+    AnalysisCompleteCallback,
+    AnalysisResults,
+    RequiringAnalysisCount,
+    analyzeProgram,
+    nullCallback,
+} from './analyzer/analysis';
 import { BackgroundAnalysisProgram, InvalidatedReason } from './analyzer/backgroundAnalysisProgram';
 import { ImportResolver } from './analyzer/importResolver';
 import { OpenFileOptions, Program } from './analyzer/program';
@@ -298,13 +304,20 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
         // Stash the base directory into a global variable.
         const data = workerData as InitializationData;
         this.log(LogLevel.Info, `Background analysis(${threadId}) root directory: ${data.rootUri}`);
-        this._configOptions = new ConfigOptions(Uri.parse(data.rootUri, serviceProvider.fs().isCaseSensitive));
+        this._configOptions = new ConfigOptions(Uri.parse(data.rootUri, serviceProvider));
         this.importResolver = this.createImportResolver(serviceProvider, this._configOptions, this.createHost());
 
         const console = this.getConsole();
         this.logTracker = new LogTracker(console, `BG(${threadId})`);
 
-        this._program = new Program(this.importResolver, this._configOptions, serviceProvider, this.logTracker);
+        this._program = new Program(
+            this.importResolver,
+            this._configOptions,
+            serviceProvider,
+            this.logTracker,
+            undefined,
+            data.serviceId
+        );
     }
 
     get program(): Program {
@@ -326,6 +339,10 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
 
     protected onMessage(msg: AnalysisRequest) {
         switch (msg.requestType) {
+            case 'cacheUsageBuffer': {
+                this.serviceProvider.cacheManager()?.handleCachedUsageBufferMessage(msg);
+                break;
+            }
             case 'analyze': {
                 const port = msg.port!;
                 const data = deserialize(msg.data);
@@ -408,7 +425,7 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
 
             case 'updateChainedFileUri': {
                 const { fileUri, chainedUri } = deserialize(msg.data);
-                this.handleUpdateChainedfileUri(fileUri, chainedUri);
+                this.handleUpdateChainedFileUri(fileUri, chainedUri);
                 break;
             }
 
@@ -469,12 +486,12 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
 
     protected handleAnalyze(port: MessagePort, cancellationId: string, token: CancellationToken) {
         // Report files to analyze first.
-        const filesLeftToAnalyze = this.program.getFilesToAnalyzeCount();
+        const requiringAnalysisCount = this.program.getFilesToAnalyzeCount();
 
         this.onAnalysisCompletion(port, {
             diagnostics: [],
             filesInProgram: this.program.getFileCount(),
-            filesRequiringAnalysis: filesLeftToAnalyze,
+            requiringAnalysisCount: requiringAnalysisCount,
             checkingOnlyOpenFiles: this.program.isCheckingOnlyOpenFiles(),
             fatalErrorOccurred: false,
             configParseErrorOccurred: false,
@@ -565,7 +582,9 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
     }
 
     protected handleEnsurePartialStubPackages(executionRoot: string | undefined) {
-        const execEnv = this._configOptions.getExecutionEnvironments().find((e) => e.root === executionRoot);
+        const execEnv = this._configOptions
+            .getExecutionEnvironments()
+            .find((e) => e.root?.toString() === executionRoot);
         if (execEnv) {
             this.importResolver.ensurePartialStubPackages(execEnv);
         }
@@ -590,8 +609,8 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
         );
     }
 
-    protected handleUpdateChainedfileUri(fileUri: Uri, chainedfileUri: Uri | undefined) {
-        this.program.updateChainedUri(fileUri, chainedfileUri);
+    protected handleUpdateChainedFileUri(fileUri: Uri, chainedFileUri: Uri | undefined) {
+        this.program.updateChainedUri(fileUri, chainedFileUri);
     }
 
     protected handleSetFileClosed(fileUri: Uri, isTracked: boolean | undefined) {
@@ -665,12 +684,16 @@ export abstract class BackgroundAnalysisRunnerBase extends BackgroundThreadBase 
         }
     }
 
-    private _reportDiagnostics(diagnostics: FileDiagnostics[], filesLeftToAnalyze: number, elapsedTime: number) {
+    private _reportDiagnostics(
+        diagnostics: FileDiagnostics[],
+        requiringAnalysisCount: RequiringAnalysisCount,
+        elapsedTime: number
+    ) {
         if (parentPort) {
             this.onAnalysisCompletion(parentPort, {
                 diagnostics,
                 filesInProgram: this.program.getFileCount(),
-                filesRequiringAnalysis: filesLeftToAnalyze,
+                requiringAnalysisCount: requiringAnalysisCount,
                 checkingOnlyOpenFiles: this.program.isCheckingOnlyOpenFiles(),
                 fatalErrorOccurred: false,
                 configParseErrorOccurred: false,
@@ -740,12 +763,14 @@ export type AnalysisRequestKind =
     | 'setImportResolver'
     | 'shutdown'
     | 'addInterimFile'
-    | 'analyzeFile';
+    | 'analyzeFile'
+    | 'cacheUsageBuffer';
 
 export interface AnalysisRequest {
     requestType: AnalysisRequestKind;
     data: string | null;
     port?: MessagePort | undefined;
+    sharedUsageBuffer?: SharedArrayBuffer;
 }
 
 export type AnalysisResponseKind = 'log' | 'analysisResult' | 'analysisPaused' | 'analysisDone';

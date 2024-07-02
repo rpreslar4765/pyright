@@ -15,9 +15,7 @@ import { maxSubtypesForInferredType, TypeEvaluator } from './typeEvaluatorTypes'
 import {
     ClassType,
     combineTypes,
-    FunctionParameter,
     FunctionType,
-    FunctionTypeFlags,
     isAny,
     isAnyOrUnknown,
     isClass,
@@ -101,7 +99,7 @@ export function assignTypeToTypeVar(
 
     let isTypeVarInScope = true;
     const isInvariant = (flags & AssignTypeFlags.EnforceInvariance) !== 0;
-    const isContravariant = (flags & AssignTypeFlags.ReverseTypeVarMatching) !== 0;
+    const isContravariant = (flags & AssignTypeFlags.ReverseTypeVarMatching) !== 0 && !isInvariant;
 
     // If the TypeVar doesn't have a scope ID, then it's being used
     // outside of a valid TypeVar scope. This will be reported as a
@@ -145,7 +143,7 @@ export function assignTypeToTypeVar(
             destType.details.isParamSpec &&
             isFunction(srcType) &&
             FunctionType.isParamSpecValue(srcType) &&
-            FunctionType.shouldSkipArgsKwargsCompatibilityCheck(srcType)
+            FunctionType.isGradualCallableForm(srcType)
         ) {
             return true;
         }
@@ -251,7 +249,7 @@ export function assignTypeToTypeVar(
     if (!curWideTypeBound && !destType.details.isSynthesizedSelf) {
         curWideTypeBound = destType.details.boundType;
     }
-    const curNarrowTypeBound = curEntry?.narrowBound;
+    let curNarrowTypeBound = curEntry?.narrowBound;
     let newNarrowTypeBound = curNarrowTypeBound;
     let newWideTypeBound = curWideTypeBound;
     const diagAddendum = diag ? new DiagnosticAddendum() : undefined;
@@ -328,10 +326,7 @@ export function assignTypeToTypeVar(
                 )
             ) {
                 // The srcType is narrower than the current wideTypeBound, so replace it.
-                // If it's Any, don't replace it because Any is the narrowest type already.
-                if (!isAnyOrUnknown(curWideTypeBound)) {
-                    newWideTypeBound = adjSrcType;
-                }
+                newWideTypeBound = adjSrcType;
             } else if (
                 !evaluator.assignType(
                     adjSrcType,
@@ -383,8 +378,15 @@ export function assignTypeToTypeVar(
         if (!curNarrowTypeBound || isTypeSame(destType, curNarrowTypeBound)) {
             // There was previously no narrow bound. We've now established one.
             newNarrowTypeBound = adjSrcType;
-        } else if (!isTypeSame(curNarrowTypeBound, adjSrcType, {}, recursionCount)) {
-            if (isAnyOrUnknown(adjSrcType) && curEntry.tupleTypes) {
+        } else if (isTypeSame(curNarrowTypeBound, adjSrcType, {}, recursionCount)) {
+            // If this is an invariant context and there is currently no wide type bound
+            // established, use the "no literals" version of the narrow type bounds rather
+            // than a version that has literals.
+            if (!newWideTypeBound && isInvariant && curEntry?.narrowBoundNoLiterals) {
+                newNarrowTypeBound = curEntry.narrowBoundNoLiterals;
+            }
+        } else {
+            if (isAnyOrUnknown(adjSrcType) && curEntry?.tupleTypes) {
                 // Handle the tuple case specially. If Any or Unknown is assigned
                 // during the construction of a tuple, the resulting tuple type must
                 // be tuple[Any, ...], which is compatible with any tuple.
@@ -474,6 +476,14 @@ export function assignTypeToTypeVar(
                     newNarrowTypeBound = widenedType;
                 } else {
                     const objectType = evaluator.getObjectType();
+
+                    // If this is an invariant context and there is currently no wide type bound
+                    // established, use the "no literals" version of the narrow type bounds rather
+                    // than a version that has literals.
+                    if (!newWideTypeBound && isInvariant && curEntry?.narrowBoundNoLiterals) {
+                        curNarrowTypeBound = curEntry.narrowBoundNoLiterals;
+                    }
+
                     const curSolvedNarrowTypeBound = applySolvedTypeVars(curNarrowTypeBound, typeVarContext);
 
                     // In some extreme edge cases, the narrow type bound can become
@@ -501,35 +511,53 @@ export function assignTypeToTypeVar(
             }
         }
 
+        // If this is an invariant context, make sure the narrow type bound
+        // isn't too wide.
+        if (isInvariant && newNarrowTypeBound) {
+            if (
+                !evaluator.assignType(
+                    adjSrcType,
+                    newNarrowTypeBound,
+                    diag?.createAddendum(),
+                    /* destTypeVarContext */ undefined,
+                    /* srcTypeVarContext */ undefined,
+                    AssignTypeFlags.IgnoreTypeVarScope,
+                    recursionCount
+                )
+            ) {
+                if (diag && diagAddendum) {
+                    diag.addMessage(
+                        LocAddendum.typeAssignmentMismatch().format(
+                            evaluator.printSrcDestTypes(newNarrowTypeBound, adjSrcType)
+                        )
+                    );
+                }
+                return false;
+            }
+        }
+
         // Make sure we don't exceed the wide type bound.
         if (curWideTypeBound && newNarrowTypeBound) {
             if (!isTypeSame(curWideTypeBound, newNarrowTypeBound, {}, recursionCount)) {
-                let makeConcrete = true;
+                let adjWideTypeBound = evaluator.makeTopLevelTypeVarsConcrete(
+                    curWideTypeBound,
+                    /* makeParamSpecsConcrete */ true
+                );
 
-                // Handle the case where the wide type is type T and the narrow type
-                // is type T | <some other type>. In this case, it violates the
-                // wide type bound.
-                if (isTypeVar(curWideTypeBound)) {
-                    if (isTypeSame(newNarrowTypeBound, curWideTypeBound)) {
-                        makeConcrete = false;
-                    } else if (
-                        isUnion(newNarrowTypeBound) &&
-                        newNarrowTypeBound.subtypes.some((subtype) => isTypeSame(subtype, curWideTypeBound!))
-                    ) {
-                        makeConcrete = false;
-                    }
-                }
-
-                const adjWideTypeBound = makeConcrete
-                    ? evaluator.makeTopLevelTypeVarsConcrete(curWideTypeBound, /* makeParamSpecsConcrete */ true)
-                    : curWideTypeBound;
+                // Convert any remaining (non-top-level) TypeVars in the wide type
+                // bound to in-scope placeholders.
+                adjWideTypeBound = transformExpectedType(
+                    adjWideTypeBound,
+                    /* liveTypeVarScopes */ [],
+                    /* usageOffset */ undefined
+                );
 
                 if (
                     !evaluator.assignType(
                         adjWideTypeBound,
                         newNarrowTypeBound,
                         diag?.createAddendum(),
-                        typeVarContext,
+                        /* destTypeVarContext */ undefined,
                         /* srcTypeVarContext */ undefined,
                         AssignTypeFlags.IgnoreTypeVarScope,
                         recursionCount
@@ -546,6 +574,10 @@ export function assignTypeToTypeVar(
                 }
             }
         }
+    }
+
+    if (!newWideTypeBound && isInvariant) {
+        newWideTypeBound = newNarrowTypeBound;
     }
 
     // If there's a bound type, make sure the source is assignable to it.
@@ -878,54 +910,29 @@ function assignTypeToParamSpec(
     recursionCount = 0
 ) {
     let isAssignable = true;
+    const adjSrcType = isFunction(srcType) ? convertParamSpecValueToType(srcType) : srcType;
 
     typeVarContext.doForEachSignature((signatureContext) => {
-        if (isTypeVar(srcType) && srcType.details.isParamSpec) {
+        if (isTypeVar(adjSrcType) && adjSrcType.details.isParamSpec) {
             const existingType = signatureContext.getParamSpecType(destType);
             if (existingType) {
-                if (existingType.details.parameters.length === 0 && existingType.details.paramSpec) {
+                const existingTypeParamSpec = FunctionType.getParamSpecFromArgsKwargs(existingType);
+                const existingTypeWithoutArgsKwargs = FunctionType.cloneRemoveParamSpecArgsKwargs(existingType);
+
+                if (existingTypeWithoutArgsKwargs.details.parameters.length === 0 && existingTypeParamSpec) {
                     // If there's an existing entry that matches, that's fine.
-                    if (isTypeSame(existingType.details.paramSpec, srcType, {}, recursionCount)) {
+                    if (isTypeSame(existingTypeParamSpec, adjSrcType, {}, recursionCount)) {
                         return;
                     }
                 }
             } else {
                 if (!typeVarContext.isLocked() && typeVarContext.hasSolveForScope(destType.scopeId)) {
-                    signatureContext.setTypeVarType(destType, convertTypeToParamSpecValue(srcType));
+                    signatureContext.setTypeVarType(destType, convertTypeToParamSpecValue(adjSrcType));
                 }
                 return;
             }
-        } else if (isFunction(srcType)) {
-            const functionSrcType = srcType;
-            const parameters = srcType.details.parameters.map((p, index) => {
-                const param: FunctionParameter = {
-                    category: p.category,
-                    name: p.name,
-                    isNameSynthesized: p.isNameSynthesized,
-                    hasDefault: !!p.hasDefault,
-                    defaultValueExpression: p.defaultValueExpression,
-                    hasDeclaredType: p.hasDeclaredType,
-                    type: FunctionType.getEffectiveParameterType(functionSrcType, index),
-                };
-                return param;
-            });
-
-            const newFunction = FunctionType.createInstance(
-                '',
-                '',
-                '',
-                srcType.details.flags | FunctionTypeFlags.ParamSpecValue
-            );
-            parameters.forEach((param) => {
-                FunctionType.addParameter(newFunction, param);
-            });
-            newFunction.details.typeVarScopeId = srcType.details.typeVarScopeId;
-            newFunction.details.constructorTypeVarScopeId = srcType.details.constructorTypeVarScopeId;
-            newFunction.details.paramSpecTypeVarScopeId = srcType.details.paramSpecTypeVarScopeId;
-            newFunction.details.docString = srcType.details.docString;
-            newFunction.details.deprecatedMessage = srcType.details.deprecatedMessage;
-            newFunction.details.paramSpec = srcType.details.paramSpec;
-
+        } else if (isFunction(adjSrcType)) {
+            const newFunction = adjSrcType;
             let updateContextWithNewFunction = false;
 
             const existingType = signatureContext.getParamSpecType(destType);
@@ -934,30 +941,41 @@ function assignTypeToParamSpec(
                 // for comparison purposes.
                 const existingFunction = convertParamSpecValueToType(existingType);
 
-                // Should we narrow the type?
-                if (
-                    evaluator.assignType(
-                        existingFunction,
-                        newFunction,
-                        /* diag */ undefined,
-                        /* destTypeVarContext */ undefined,
-                        /* srcTypeVarContext */ undefined,
-                        AssignTypeFlags.SkipFunctionReturnTypeCheck,
-                        recursionCount
-                    )
-                ) {
+                const isNewNarrower = evaluator.assignType(
+                    existingFunction,
+                    newFunction,
+                    /* diag */ undefined,
+                    /* destTypeVarContext */ undefined,
+                    /* srcTypeVarContext */ undefined,
+                    AssignTypeFlags.SkipFunctionReturnTypeCheck,
+                    recursionCount
+                );
+
+                const isNewWider = evaluator.assignType(
+                    newFunction,
+                    existingFunction,
+                    /* diag */ undefined,
+                    /* destTypeVarContext */ undefined,
+                    /* srcTypeVarContext */ undefined,
+                    AssignTypeFlags.SkipFunctionReturnTypeCheck,
+                    recursionCount
+                );
+
+                // Should we widen the type?
+                if (isNewNarrower && isNewWider) {
+                    // The new type is both a supertype and a subtype of the existing type.
+                    // That means the two types are the same or one (or both) have the type
+                    // "..." (which is the ParamSpec equivalent of "Any"). If only one has
+                    // the type "...", we'll prefer the other one. This is analogous to
+                    // what we do with regular TypeVars, where we prefer non-Any values.
+                    if (!FunctionType.isGradualCallableForm(newFunction)) {
+                        updateContextWithNewFunction = true;
+                    } else {
+                        return;
+                    }
+                } else if (isNewWider) {
                     updateContextWithNewFunction = true;
-                } else if (
-                    evaluator.assignType(
-                        newFunction,
-                        existingFunction,
-                        /* diag */ undefined,
-                        /* destTypeVarContext */ undefined,
-                        /* srcTypeVarContext */ undefined,
-                        AssignTypeFlags.SkipFunctionReturnTypeCheck,
-                        recursionCount
-                    )
-                ) {
+                } else if (isNewNarrower) {
                     // The existing function is already narrower than the new function, so
                     // no need to narrow it further.
                     return;
@@ -972,13 +990,13 @@ function assignTypeToParamSpec(
                 }
                 return;
             }
-        } else if (isAnyOrUnknown(srcType)) {
+        } else if (isAnyOrUnknown(adjSrcType)) {
             return;
         }
 
         diag?.addMessage(
             LocAddendum.typeParamSpec().format({
-                type: evaluator.printType(srcType),
+                type: evaluator.printType(adjSrcType),
                 name: destType.details.name,
             })
         );
@@ -1002,7 +1020,7 @@ function assignTypeToParamSpec(
 // performs this reverse mapping of type arguments and populates the type var
 // map for the target type. If the type is not assignable to the expected type,
 // it returns false.
-export function populateTypeVarContextBasedOnExpectedType(
+export function addConstraintsForExpectedType(
     evaluator: TypeEvaluator,
     type: ClassType,
     expectedType: Type,

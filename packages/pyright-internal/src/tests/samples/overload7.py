@@ -209,7 +209,9 @@ _T9 = TypeVar("_T9")
 
 
 @overload
-def func12(func: Callable[[_T7], _T8], iterable: Iterable[_T7], /) -> Iterable[_T8]: ...
+def func12(
+    func: Callable[[_T7], _T8], iterable: Iterable[_T7], default_value: None = None, /
+) -> Iterable[_T8 | None]: ...
 
 
 @overload
@@ -252,7 +254,7 @@ def func14(target: Callable[..., _T14]) -> Wrapper1[_T14]: ...
 
 
 def func14(
-    target: Callable[..., Awaitable[_T14]] | Callable[..., _T14]
+    target: Callable[..., Awaitable[_T14]] | Callable[..., _T14],
 ) -> Wrapper1[_T14]: ...
 
 
@@ -331,3 +333,38 @@ def func17(**kwargs: float) -> None: ...
 
 def func17(d: dict[str, float] | None = None, /, **kwargs: float) -> None:
     pass
+
+
+@overload
+def func18(a: int) -> int: ...
+@overload
+def func18(*args: int) -> int: ...
+
+
+# This should generate an error because the keyword parameter "a" is missing.
+def func18(*args: int) -> int: ...
+
+
+@overload
+def func19(a: int) -> int: ...
+@overload
+def func19(*args: int) -> int: ...
+
+
+def func19(*args: int, a: int = 1) -> int: ...
+
+
+@overload
+def func20(a: int) -> int: ...
+@overload
+def func20(*args: int) -> int: ...
+
+
+def func20(*args: int, **kwargs: int) -> int: ...
+
+
+@overload
+def func21(x: tuple[()], /) -> None: ...
+@overload
+def func21(x: tuple[object], /) -> None: ...
+def func21(x: tuple[object, ...], /) -> None: ...

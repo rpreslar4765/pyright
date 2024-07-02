@@ -449,6 +449,17 @@ function printTypeInternal(
                             typeToWrap = `Literal[${printLiteralValue(type)}]`;
                         }
                     } else {
+                        if (type.specialForm) {
+                            return printTypeInternal(
+                                type.specialForm,
+                                printTypeFlags,
+                                returnTypeCallback,
+                                uniqueNameMap,
+                                recursionTypes,
+                                recursionCount
+                            );
+                        }
+
                         typeToWrap = printObjectTypeForClassInternal(
                             type,
                             printTypeFlags,
@@ -510,6 +521,19 @@ function printTypeInternal(
             }
 
             case TypeCategory.Union: {
+                // If this is a value expression that evaluates to a union type but is
+                // not a type alias, simply print the special form ("UnionType").
+                if (TypeBase.isInstantiable(type) && type.specialForm && !type.typeAliasInfo) {
+                    return printTypeInternal(
+                        type.specialForm,
+                        printTypeFlags,
+                        returnTypeCallback,
+                        uniqueNameMap,
+                        recursionTypes,
+                        recursionCount
+                    );
+                }
+
                 // Allocate a set that refers to subtypes in the union by
                 // their indices. If the index is within the set, it is already
                 // accounted for in the output.
@@ -783,20 +807,24 @@ function printFunctionType(
     recursionCount: number
 ) {
     if (printTypeFlags & PrintTypeFlags.PythonSyntax) {
+        const paramSpec = FunctionType.getParamSpecFromArgsKwargs(type);
+        const typeWithoutParamSpec = paramSpec ? FunctionType.cloneRemoveParamSpecArgsKwargs(type) : type;
+
         // Callable works only in cases where all parameters are positional-only.
         let isPositionalParamsOnly = false;
-        if (type.details.parameters.length === 0) {
+        if (typeWithoutParamSpec.details.parameters.length === 0) {
             isPositionalParamsOnly = true;
         } else {
-            if (type.details.parameters.every((param) => param.category === ParameterCategory.Simple)) {
-                const lastParam = type.details.parameters[type.details.parameters.length - 1];
+            if (typeWithoutParamSpec.details.parameters.every((param) => param.category === ParameterCategory.Simple)) {
+                const lastParam =
+                    typeWithoutParamSpec.details.parameters[typeWithoutParamSpec.details.parameters.length - 1];
                 if (!lastParam.name) {
                     isPositionalParamsOnly = true;
                 }
             }
         }
 
-        const returnType = returnTypeCallback(type);
+        const returnType = returnTypeCallback(typeWithoutParamSpec);
         let returnTypeString = 'Any';
         if (returnType) {
             returnTypeString = printTypeInternal(
@@ -812,9 +840,9 @@ function printFunctionType(
         if (isPositionalParamsOnly) {
             const paramTypes: string[] = [];
 
-            type.details.parameters.forEach((param, index) => {
+            typeWithoutParamSpec.details.parameters.forEach((param, index) => {
                 if (param.name) {
-                    const paramType = FunctionType.getEffectiveParameterType(type, index);
+                    const paramType = FunctionType.getEffectiveParameterType(typeWithoutParamSpec, index);
                     if (recursionTypes.length < maxTypeRecursionCount) {
                         paramTypes.push(
                             printTypeInternal(
@@ -832,14 +860,14 @@ function printFunctionType(
                 }
             });
 
-            if (type.details.paramSpec) {
+            if (paramSpec) {
                 if (paramTypes.length > 0) {
                     return `Callable[Concatenate[${paramTypes.join(', ')}, ${
-                        type.details.paramSpec.details.name
+                        paramSpec.details.name
                     }], ${returnTypeString}]`;
                 }
 
-                return `Callable[${type.details.paramSpec.details.name}, ${returnTypeString}]`;
+                return `Callable[${paramSpec.details.name}, ${returnTypeString}]`;
             }
 
             return `Callable[[${paramTypes.join(', ')}], ${returnTypeString}]`;
@@ -1056,6 +1084,12 @@ function printFunctionPartsInternal(
     const paramTypeStrings: string[] = [];
     let sawDefinedName = false;
 
+    // Remove the (*args: P.args, **kwargs: P.kwargs) from the end of the parameter list.
+    const paramSpec = FunctionType.getParamSpecFromArgsKwargs(type);
+    if (paramSpec) {
+        type = FunctionType.cloneRemoveParamSpecArgsKwargs(type);
+    }
+
     type.details.parameters.forEach((param, index) => {
         // Handle specialized variadic type parameters specially.
         if (
@@ -1204,7 +1238,7 @@ function printFunctionPartsInternal(
         }
 
         // If this is a (...) signature, replace the *args, **kwargs with "...".
-        if (FunctionType.shouldSkipArgsKwargsCompatibilityCheck(type) && !isParamSpecArgsKwargsParam) {
+        if (FunctionType.isGradualCallableForm(type) && !isParamSpecArgsKwargsParam) {
             if (param.category === ParameterCategory.ArgsList) {
                 paramString = '...';
             } else if (param.category === ParameterCategory.KwargsDict) {
@@ -1215,14 +1249,14 @@ function printFunctionPartsInternal(
         paramTypeStrings.push(paramString);
     });
 
-    if (type.details.paramSpec) {
+    if (paramSpec) {
         if (printTypeFlags & PrintTypeFlags.PythonSyntax) {
-            paramTypeStrings.push(`*args: ${type.details.paramSpec}.args`);
-            paramTypeStrings.push(`**kwargs: ${type.details.paramSpec}.kwargs`);
+            paramTypeStrings.push(`*args: ${paramSpec}.args`);
+            paramTypeStrings.push(`**kwargs: ${paramSpec}.kwargs`);
         } else {
             paramTypeStrings.push(
                 `**${printTypeInternal(
-                    type.details.paramSpec,
+                    paramSpec,
                     printTypeFlags,
                     returnTypeCallback,
                     uniqueNameMap,

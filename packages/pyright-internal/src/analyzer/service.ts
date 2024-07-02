@@ -17,6 +17,7 @@ import { CancellationProvider, DefaultCancellationProvider } from '../common/can
 import { CommandLineOptions } from '../common/commandLineOptions';
 import { ConfigOptions, matchFileSpecs } from '../common/configOptions';
 import { ConsoleInterface, LogLevel, StandardConsole, log } from '../common/console';
+import { isString } from '../common/core';
 import { Diagnostic } from '../common/diagnostic';
 import { FileEditAction } from '../common/editAction';
 import { EditableProgram, ProgramView } from '../common/extensibility';
@@ -25,8 +26,8 @@ import { FileWatcher, FileWatcherEventType, ignoredWatchEventFunction } from '..
 import { Host, HostFactory, NoAccessHost } from '../common/host';
 import { defaultStubsDirectory } from '../common/pathConsts';
 import { getFileName, isRootedDiskPath, normalizeSlashes } from '../common/pathUtils';
+import { ServiceKeys } from '../common/serviceKeys';
 import { ServiceProvider } from '../common/serviceProvider';
-import { ServiceKeys } from '../common/serviceProviderExtensions';
 import { Range } from '../common/textRange';
 import { timingStats } from '../common/timing';
 import { Uri } from '../common/uri/uri';
@@ -52,9 +53,8 @@ import { ImportResolver, ImportResolverFactory, createImportedModuleDescriptor }
 import { MaxAnalysisTime, Program } from './program';
 import { findPythonSearchPaths } from './pythonPathUtils';
 import { IPythonMode } from './sourceFile';
-import { TypeEvaluator } from './typeEvaluatorTypes';
 
-export const configFileNames = ['pyrightconfig.json'];
+export const configFileName = 'pyrightconfig.json';
 export const pyprojectTomlName = 'pyproject.toml';
 
 // How long since the last user activity should we wait until running
@@ -84,6 +84,11 @@ export interface AnalyzerServiceOptions {
     fileSystem?: FileSystem;
 }
 
+interface ConfigFileContents {
+    configFileDirUri: Uri;
+    configFileJsonObj: object;
+}
+
 // Hold uniqueId for this service. It can be used to distinguish each service later.
 let _nextServiceId = 1;
 
@@ -103,7 +108,8 @@ export class AnalyzerService {
     private _sourceFileWatcher: FileWatcher | undefined;
     private _reloadConfigTimer: any;
     private _libraryReanalysisTimer: any;
-    private _configFileUri: Uri | undefined;
+    private _primaryConfigFileUri: Uri | undefined;
+    private _extendedConfigFileUris: Uri[] = [];
     private _configFileWatcher: FileWatcher | undefined;
     private _libraryFileWatcher: FileWatcher | undefined;
     private _librarySearchUrisToWatch: Uri[] | undefined;
@@ -142,8 +148,7 @@ export class AnalyzerService {
         this._options.hostFactory = options.hostFactory ?? (() => new NoAccessHost());
 
         this._options.configOptions =
-            options.configOptions ??
-            new ConfigOptions(Uri.file(process.cwd(), this._serviceProvider.fs().isCaseSensitive));
+            options.configOptions ?? new ConfigOptions(Uri.file(process.cwd(), this._serviceProvider));
         const importResolver = this._options.importResolverFactory(
             this._serviceProvider,
             this._options.configOptions,
@@ -272,11 +277,11 @@ export class AnalyzerService {
         this._backgroundAnalysisProgram.setCompletionCallback(callback);
     }
 
-    setOptions(commandLineOptions: CommandLineOptions, newRoot?: Uri): void {
+    setOptions(commandLineOptions: CommandLineOptions): void {
         this._commandLineOptions = commandLineOptions;
 
         const host = this._hostFactory();
-        const configOptions = this._getConfigOptions(host, commandLineOptions, newRoot);
+        const configOptions = this._getConfigOptions(host, commandLineOptions);
 
         if (configOptions.pythonPath) {
             // Make sure we have default python environment set.
@@ -352,7 +357,11 @@ export class AnalyzerService {
         this._backgroundAnalysisProgram.addInterimFile(uri);
     }
 
-    getParseResult(uri: Uri) {
+    getParserOutput(uri: Uri) {
+        return this._program.getParserOutput(uri);
+    }
+
+    getParseResults(uri: Uri) {
         return this._program.getParseResults(uri);
     }
 
@@ -362,10 +371,6 @@ export class AnalyzerService {
 
     getTextOnRange(fileUri: Uri, range: Range, token: CancellationToken) {
         return this._program.getTextOnRange(fileUri, range, token);
-    }
-
-    getEvaluator(): TypeEvaluator | undefined {
-        return this._program.evaluator;
     }
 
     run<T>(callback: (p: ProgramView) => T, token: CancellationToken): T {
@@ -513,10 +518,14 @@ export class AnalyzerService {
 
     // Calculates the effective options based on the command-line options,
     // an optional config file, and default values.
-    private _getConfigOptions(host: Host, commandLineOptions: CommandLineOptions, possibleRoot?: Uri): ConfigOptions {
-        const executionRootUri =
-            possibleRoot ??
-            Uri.file(commandLineOptions.executionRoot, this.fs.isCaseSensitive, /* checkRelative */ true);
+    private _getConfigOptions(host: Host, commandLineOptions: CommandLineOptions): ConfigOptions {
+        const optionRoot = commandLineOptions.executionRoot;
+        const executionRootUri = Uri.is(optionRoot)
+            ? optionRoot
+            : isString(optionRoot) && optionRoot.length > 0
+            ? Uri.file(optionRoot, this.serviceProvider, /* checkRelative */ true)
+            : Uri.defaultWorkspace(this.serviceProvider);
+
         const executionRoot = this.fs.realCasePath(executionRootUri);
         let projectRoot = executionRoot;
         let configFilePath: Uri | undefined;
@@ -528,14 +537,15 @@ export class AnalyzerService {
             // or a file.
             configFilePath = this.fs.realCasePath(
                 isRootedDiskPath(commandLineOptions.configFilePath)
-                    ? Uri.file(commandLineOptions.configFilePath, this.fs.isCaseSensitive, /* checkRelative */ true)
+                    ? Uri.file(commandLineOptions.configFilePath, this.serviceProvider, /* checkRelative */ true)
                     : projectRoot.resolvePaths(commandLineOptions.configFilePath)
             );
+
             if (!this.fs.existsSync(configFilePath)) {
                 this._console.info(`Configuration file not found at ${configFilePath.toUserVisibleString()}.`);
                 configFilePath = projectRoot;
             } else {
-                if (configFilePath.lastExtension.endsWith('.json')) {
+                if (configFilePath.lastExtension.endsWith('.json') || configFilePath.lastExtension.endsWith('.toml')) {
                     projectRoot = configFilePath.getDirectory();
                 } else {
                     projectRoot = configFilePath;
@@ -581,7 +591,11 @@ export class AnalyzerService {
             }
         }
 
-        const configOptions = new ConfigOptions(projectRoot, this._typeCheckingMode);
+        const configOptions = new ConfigOptions(projectRoot);
+        configOptions.initializeTypeCheckingMode(
+            this._typeCheckingMode,
+            commandLineOptions.diagnosticSeverityOverrides
+        );
         const defaultExcludes = ['**/node_modules', '**/__pycache__', '**/.*'];
 
         if (commandLineOptions.pythonPath) {
@@ -589,7 +603,7 @@ export class AnalyzerService {
                 `Setting pythonPath for service "${this._instanceName}": ` + `"${commandLineOptions.pythonPath}"`
             );
             configOptions.pythonPath = this.fs.realCasePath(
-                Uri.file(commandLineOptions.pythonPath, this.fs.isCaseSensitive, /* checkRelative */ true)
+                Uri.file(commandLineOptions.pythonPath, this.serviceProvider, /* checkRelative */ true)
             );
         }
 
@@ -611,86 +625,56 @@ export class AnalyzerService {
             commandLineOptions.extraPaths
         );
 
-        if (commandLineOptions.includeFileSpecs.length > 0) {
-            commandLineOptions.includeFileSpecs.forEach((fileSpec) => {
-                configOptions.include.push(getFileSpec(projectRoot, fileSpec));
-            });
-        }
+        commandLineOptions.includeFileSpecs.forEach((fileSpec) => {
+            configOptions.include.push(getFileSpec(projectRoot, fileSpec));
+        });
 
-        if (commandLineOptions.excludeFileSpecs.length > 0) {
-            commandLineOptions.excludeFileSpecs.forEach((fileSpec) => {
-                configOptions.exclude.push(getFileSpec(projectRoot, fileSpec));
-            });
-        }
+        commandLineOptions.excludeFileSpecs.forEach((fileSpec) => {
+            configOptions.exclude.push(getFileSpec(projectRoot, fileSpec));
+        });
 
-        if (commandLineOptions.ignoreFileSpecs.length > 0) {
-            commandLineOptions.ignoreFileSpecs.forEach((fileSpec) => {
-                configOptions.ignore.push(getFileSpec(projectRoot, fileSpec));
-            });
-        }
-
-        if (!configFilePath && commandLineOptions.executionRoot) {
-            if (commandLineOptions.includeFileSpecs.length === 0) {
-                // If no config file was found and there are no explicit include
-                // paths specified, assume the caller wants to include all source
-                // files under the execution root path.
-                configOptions.include.push(getFileSpec(executionRoot, '.'));
-            }
-
-            if (commandLineOptions.excludeFileSpecs.length === 0) {
-                // Add a few common excludes to avoid long scan times.
-                defaultExcludes.forEach((exclude) => {
-                    configOptions.exclude.push(getFileSpec(executionRoot, exclude));
-                });
-            }
-        }
-
-        this._configFileUri = configFilePath || pyprojectFilePath;
+        commandLineOptions.ignoreFileSpecs.forEach((fileSpec) => {
+            configOptions.ignore.push(getFileSpec(projectRoot, fileSpec));
+        });
 
         configOptions.disableTaggedHints = !!commandLineOptions.disableTaggedHints;
 
-        // If we found a config file, parse it to compute the effective options.
-        let configJsonObj: object | undefined;
-        if (configFilePath) {
-            this._console.info(`Loading configuration file at ${configFilePath.toUserVisibleString()}`);
-            configJsonObj = this._parseJsonConfigFile(configFilePath);
-        } else if (pyprojectFilePath) {
-            this._console.info(`Loading pyproject.toml file at ${pyprojectFilePath.toUserVisibleString()}`);
-            configJsonObj = this._parsePyprojectTomlFile(pyprojectFilePath);
-        }
+        configOptions.initializeTypeCheckingMode(commandLineOptions.typeCheckingMode ?? 'standard');
 
-        if (configJsonObj) {
-            configOptions.initializeFromJson(
-                configJsonObj,
-                this._typeCheckingMode,
-                this.serviceProvider,
-                host,
-                commandLineOptions
-            );
+        const configs = this._getExtendedConfigurations(configFilePath ?? pyprojectFilePath);
 
-            const configFileDir = this._configFileUri!.getDirectory();
-
-            // If no include paths were provided, assume that all files within
-            // the project should be included.
-            if (configOptions.include.length === 0) {
-                this._console.info(`No include entries specified; assuming ${configFileDir.toUserVisibleString()}`);
-                configOptions.include.push(getFileSpec(configFileDir, '.'));
-            }
-
-            // If there was no explicit set of excludes, add a few common ones to avoid long scan times.
-            if (configOptions.exclude.length === 0) {
-                defaultExcludes.forEach((exclude) => {
-                    this._console.info(`Auto-excluding ${exclude}`);
-                    configOptions.exclude.push(getFileSpec(configFileDir, exclude));
-                });
-
-                if (configOptions.autoExcludeVenv === undefined) {
-                    configOptions.autoExcludeVenv = true;
-                }
+        if (configs && configs.length > 0) {
+            for (const config of configs) {
+                configOptions.initializeFromJson(
+                    config.configFileJsonObj,
+                    config.configFileDirUri,
+                    this.serviceProvider,
+                    host,
+                    commandLineOptions
+                );
             }
         } else {
-            configOptions.autoExcludeVenv = true;
             configOptions.applyDiagnosticOverrides(commandLineOptions.diagnosticSeverityOverrides);
+        }
+
+        // If no include paths were provided, assume that all files within
+        // the project should be included.
+        if (configOptions.include.length === 0) {
+            this._console.info(`No include entries specified; assuming ${projectRoot.toUserVisibleString()}`);
+            configOptions.include.push(getFileSpec(projectRoot, '.'));
+        }
+
+        // If there was no explicit set of excludes, add a few common ones to
+        // avoid long scan times.
+        if (configOptions.exclude.length === 0) {
+            defaultExcludes.forEach((exclude) => {
+                this._console.info(`Auto-excluding ${exclude}`);
+                configOptions.exclude.push(getFileSpec(projectRoot, exclude));
+            });
+
+            if (configOptions.autoExcludeVenv === undefined) {
+                configOptions.autoExcludeVenv = true;
+            }
         }
 
         // Override the analyzeUnannotatedFunctions setting based on the command-line setting.
@@ -704,7 +688,7 @@ export class AnalyzerService {
             configOptions.include = [];
             commandLineOptions.includeFileSpecsOverride.forEach((include) => {
                 configOptions.include.push(
-                    getFileSpec(Uri.file(include, this.fs.isCaseSensitive, /* checkRelative */ true), '.')
+                    getFileSpec(Uri.file(include, this.serviceProvider, /* checkRelative */ true), '.')
                 );
             });
         }
@@ -857,6 +841,61 @@ export class AnalyzerService {
         return configOptions;
     }
 
+    // Loads the config JSON object from the specified config file along with any
+    // chained config files specified in the "extends" property (recursively).
+    private _getExtendedConfigurations(primaryConfigFileUri: Uri | undefined): ConfigFileContents[] | undefined {
+        this._primaryConfigFileUri = primaryConfigFileUri;
+        this._extendedConfigFileUris = [];
+
+        if (!primaryConfigFileUri) {
+            return undefined;
+        }
+
+        let curConfigFileUri = primaryConfigFileUri;
+
+        const configJsonObjs: ConfigFileContents[] = [];
+
+        while (true) {
+            this._extendedConfigFileUris.push(curConfigFileUri);
+
+            let configFileJsonObj: object | undefined;
+
+            // Is this a TOML or JSON file?
+            if (curConfigFileUri.lastExtension.endsWith('.toml')) {
+                this._console.info(`Loading pyproject.toml file at ${curConfigFileUri.toUserVisibleString()}`);
+                configFileJsonObj = this._parsePyprojectTomlFile(curConfigFileUri);
+            } else {
+                this._console.info(`Loading configuration file at ${curConfigFileUri.toUserVisibleString()}`);
+                configFileJsonObj = this._parseJsonConfigFile(curConfigFileUri);
+            }
+
+            if (!configFileJsonObj) {
+                break;
+            }
+
+            // Push onto the start of the array so base configs are processed first.
+            configJsonObjs.unshift({ configFileJsonObj, configFileDirUri: curConfigFileUri.getDirectory() });
+
+            const baseConfigUri = ConfigOptions.resolveExtends(configFileJsonObj, curConfigFileUri.getDirectory());
+            if (!baseConfigUri) {
+                break;
+            }
+
+            // Check for circular references.
+            if (this._extendedConfigFileUris.some((uri) => uri.equals(baseConfigUri))) {
+                this._console.error(
+                    `Circular reference in configuration file "extends" setting: ${curConfigFileUri.toUserVisibleString()} ` +
+                        `extends ${baseConfigUri.toUserVisibleString()}`
+                );
+                break;
+            }
+
+            curConfigFileUri = baseConfigUri;
+        }
+
+        return configJsonObjs;
+    }
+
     private _getTypeStubFolder() {
         const stubPath =
             this._configOptions.stubPath ??
@@ -911,12 +950,11 @@ export class AnalyzerService {
     }
 
     private _findConfigFile(searchPath: Uri): Uri | undefined {
-        for (const name of configFileNames) {
-            const fileName = searchPath.resolvePaths(name);
-            if (this.fs.existsSync(fileName)) {
-                return this.fs.realCasePath(fileName);
-            }
+        const fileName = searchPath.resolvePaths(configFileName);
+        if (this.fs.existsSync(fileName)) {
+            return this.fs.realCasePath(fileName);
         }
+
         return undefined;
     }
 
@@ -1083,7 +1121,7 @@ export class AnalyzerService {
                     this._typeStubTargetUri = rootPackagePath.getDirectory();
                 }
 
-                if (!finalResolvedPath) {
+                if (finalResolvedPath.isEmpty()) {
                     this._typeStubTargetIsSingleFile = false;
                 } else {
                     filesToImport.push(finalResolvedPath);
@@ -1123,7 +1161,7 @@ export class AnalyzerService {
     }
 
     private _matchFiles(include: FileSpec[], exclude: FileSpec[]): Uri[] {
-        const envMarkers = [['bin', 'activate'], ['Scripts', 'activate'], ['pyvenv.cfg']];
+        const envMarkers = [['bin', 'activate'], ['Scripts', 'activate'], ['pyvenv.cfg'], ['conda-meta']];
         const results: Uri[] = [];
         const startTime = Date.now();
         const longOperationLimitInSec = 10;
@@ -1269,7 +1307,7 @@ export class AnalyzerService {
                         return;
                     }
 
-                    let uri = Uri.file(path, this.fs.isCaseSensitive, /* checkRelative */ true);
+                    let uri = Uri.file(path, this.serviceProvider, /* checkRelative */ true);
 
                     // Make sure path is the true case.
                     uri = this.fs.realCasePath(uri);
@@ -1455,7 +1493,7 @@ export class AnalyzerService {
                         return;
                     }
 
-                    const uri = Uri.file(path, this.fs.isCaseSensitive, /* checkRelative */ true);
+                    const uri = Uri.file(path, this.serviceProvider, /* checkRelative */ true);
 
                     if (!this._shouldHandleLibraryFileWatchChanges(uri, watchList)) {
                         return;
@@ -1570,8 +1608,8 @@ export class AnalyzerService {
             return;
         }
 
-        if (this._configFileUri) {
-            this._configFileWatcher = this.fs.createFileSystemWatcher([this._configFileUri], (event) => {
+        if (this._primaryConfigFileUri) {
+            this._configFileWatcher = this.fs.createFileSystemWatcher(this._extendedConfigFileUris, (event) => {
                 if (this._verboseOutput) {
                     this._console.info(`Received fs event '${event}' for config file`);
                 }
@@ -1585,7 +1623,7 @@ export class AnalyzerService {
 
                 if (event === 'add' || event === 'change') {
                     const fileName = getFileName(path);
-                    if (fileName && configFileNames.some((name) => name === fileName)) {
+                    if (fileName === configFileName) {
                         if (this._verboseOutput) {
                             this._console.info(`Received fs event '${event}' for config file`);
                         }
@@ -1621,8 +1659,8 @@ export class AnalyzerService {
     private _reloadConfigFile() {
         this._updateConfigFileWatcher();
 
-        if (this._configFileUri) {
-            this._console.info(`Reloading configuration file at ${this._configFileUri.toUserVisibleString()}`);
+        if (this._primaryConfigFileUri) {
+            this._console.info(`Reloading configuration file at ${this._primaryConfigFileUri.toUserVisibleString()}`);
 
             const host = this._backgroundAnalysisProgram.host;
 
@@ -1727,7 +1765,7 @@ export class AnalyzerService {
             this._onCompletionCallback({
                 diagnostics: [],
                 filesInProgram: 0,
-                filesRequiringAnalysis: 0,
+                requiringAnalysisCount: { files: 0, cells: 0 },
                 checkingOnlyOpenFiles: true,
                 fatalErrorOccurred: false,
                 configParseErrorOccurred: true,

@@ -494,13 +494,25 @@ export class Tokenizer {
                     } else {
                         this._cs.advance(2);
                     }
+
                     this._addLineRange();
-                    return true;
-                } else if (this._cs.nextChar === Char.LineFeed) {
-                    this._cs.advance(2);
-                    this._addLineRange();
+
+                    if (this._tokens.length > 0 && this._tokens[this._tokens.length - 1].type === TokenType.NewLine) {
+                        this._readIndentationAfterNewLine();
+                    }
                     return true;
                 }
+
+                if (this._cs.nextChar === Char.LineFeed) {
+                    this._cs.advance(2);
+                    this._addLineRange();
+
+                    if (this._tokens.length > 0 && this._tokens[this._tokens.length - 1].type === TokenType.NewLine) {
+                        this._readIndentationAfterNewLine();
+                    }
+                    return true;
+                }
+
                 return this._handleInvalid();
             }
 
@@ -1268,7 +1280,7 @@ export class Tokenizer {
         const length = this._cs.position - start;
         const comment = Comment.create(start, length, this._cs.getText().slice(start, start + length));
 
-        const typeIgnoreRegexMatch = comment.value.match(/((^|#)\s*)type:\s*ignore(\s*\[([\s*\w-,]*)\]|\s|$)/);
+        const typeIgnoreRegexMatch = comment.value.match(/((^|#)\s*)type:\s*ignore(\s*\[([\s\w-,]*)\]|\s|$)/);
         if (typeIgnoreRegexMatch) {
             const commentStart = start + (typeIgnoreRegexMatch.index ?? 0);
             const textRange: TextRange = {
@@ -1287,7 +1299,7 @@ export class Tokenizer {
             }
         }
 
-        const pyrightIgnoreRegexMatch = comment.value.match(/((^|#)\s*)pyright:\s*ignore(\s*\[([\s*\w-,]*)\]|\s|$)/);
+        const pyrightIgnoreRegexMatch = comment.value.match(/((^|#)\s*)pyright:\s*ignore(\s*\[([\s\w-,]*)\]|\s|$)/);
         if (pyrightIgnoreRegexMatch) {
             const commentStart = start + (pyrightIgnoreRegexMatch.index ?? 0);
             const textRange: TextRange = {
@@ -1593,6 +1605,7 @@ export class Tokenizer {
                     this._cs.getCurrentChar() === Char.N &&
                     this._cs.nextChar === Char.OpenBrace
                 ) {
+                    flags |= StringTokenFlags.NamedUnicodeEscape;
                     isInNamedUnicodeEscape = true;
                 } else {
                     // If this is an f-string, the only escapes that are allowed is for

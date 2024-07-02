@@ -20,8 +20,6 @@ import {
     SignatureInformation,
 } from 'vscode-languageserver';
 
-import { convertDocStringToMarkdown, convertDocStringToPlainText } from '../analyzer/docStringConversion';
-import { extractParameterDocumentation } from '../analyzer/docStringUtils';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { getCallNodeAndActiveParameterIndex } from '../analyzer/parseTreeUtils';
 import { SourceMapper } from '../analyzer/sourceMapper';
@@ -33,11 +31,14 @@ import { convertPositionToOffset } from '../common/positionUtils';
 import { Position } from '../common/textRange';
 import { Uri } from '../common/uri/uri';
 import { CallNode, NameNode, ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { getDocumentationPartsForTypeAndDecl, getFunctionDocStringFromType } from './tooltipUtils';
+import { DocStringService } from '../common/docStringService';
+import { getFileInfo } from '../analyzer/analyzerNodeInfo';
+import { isBuiltInModule } from '../analyzer/typeDocStringUtils';
 
 export class SignatureHelpProvider {
-    private readonly _parseResults: ParseResults | undefined;
+    private readonly _parseResults: ParseFileResults | undefined;
     private readonly _sourceMapper: SourceMapper;
 
     constructor(
@@ -48,6 +49,7 @@ export class SignatureHelpProvider {
         private _hasSignatureLabelOffsetCapability: boolean,
         private _hasActiveParameterCapability: boolean,
         private _context: SignatureHelpContext | undefined,
+        private _docStringService: DocStringService,
         private _token: CancellationToken
     ) {
         this._parseResults = this._program.getParseResults(this._fileUri);
@@ -73,7 +75,7 @@ export class SignatureHelpProvider {
             return undefined;
         }
 
-        let node = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, offset);
+        let node = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, offset);
 
         // See if we can get to a "better" node by backing up a few columns.
         // A "better" node is defined as one that's deeper than the current
@@ -90,7 +92,7 @@ export class SignatureHelpProvider {
             if (ch === ',' || ch === '(') {
                 break;
             }
-            const curNode = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, curOffset);
+            const curNode = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, curOffset);
             if (curNode && curNode !== initialNode) {
                 if (ParseTreeUtils.getNodeDepth(curNode) > initialDepth) {
                     node = curNode;
@@ -138,12 +140,17 @@ export class SignatureHelpProvider {
         const signatures = signatureHelpResults.signatures.map((sig) => {
             let paramInfo: ParameterInformation[] = [];
             if (sig.parameters) {
-                paramInfo = sig.parameters.map((param) =>
-                    ParameterInformation.create(
-                        this._hasSignatureLabelOffsetCapability ? [param.startOffset, param.endOffset] : param.text,
-                        param.documentation
-                    )
-                );
+                paramInfo = sig.parameters.map((param) => {
+                    return {
+                        label: this._hasSignatureLabelOffsetCapability
+                            ? [param.startOffset, param.endOffset]
+                            : param.text,
+                        documentation: {
+                            kind: this._format,
+                            value: param.documentation ?? '',
+                        },
+                    };
+                });
             }
 
             const sigInfo = SignatureInformation.create(sig.label, /* documentation */ undefined, ...paramInfo);
@@ -184,7 +191,7 @@ export class SignatureHelpProvider {
                 const sig = signatures[prevActiveSignature];
                 if (isActive(sig)) {
                     activeSignature = prevActiveSignature;
-                    activeParameter = sig.activeParameter;
+                    activeParameter = sig.activeParameter ?? undefined;
                 }
             }
         }
@@ -224,6 +231,7 @@ export class SignatureHelpProvider {
         const functionDocString =
             getFunctionDocStringFromType(functionType, this._sourceMapper, this._evaluator) ??
             this._getDocStringFromCallNode(callNode);
+        const fileInfo = getFileInfo(callNode);
 
         let label = '(';
         let activeParameter: number | undefined;
@@ -241,7 +249,6 @@ export class SignatureHelpProvider {
                 startOffset: label.length,
                 endOffset: label.length + paramString.length,
                 text: paramString,
-                documentation: extractParameterDocumentation(functionDocString || '', paramName),
             });
 
             // Name match for active parameter. The set of parameters from the function
@@ -265,6 +272,18 @@ export class SignatureHelpProvider {
             }
         }
 
+        // Extract the documentation only for the active parameter.
+        if (activeParameter !== undefined) {
+            const activeParam = parameters[activeParameter];
+            if (activeParam) {
+                activeParam.documentation = this._docStringService.extractParameterDocumentation(
+                    functionDocString || '',
+                    params[activeParameter].name || '',
+                    this._format
+                );
+            }
+        }
+
         const sigInfo: SignatureInfo = {
             label,
             parameters,
@@ -275,12 +294,15 @@ export class SignatureHelpProvider {
             if (this._format === MarkupKind.Markdown) {
                 sigInfo.documentation = {
                     kind: MarkupKind.Markdown,
-                    value: convertDocStringToMarkdown(functionDocString),
+                    value: this._docStringService.convertDocStringToMarkdown(
+                        functionDocString,
+                        isBuiltInModule(fileInfo?.fileUri)
+                    ),
                 };
             } else {
                 sigInfo.documentation = {
                     kind: MarkupKind.PlainText,
-                    value: convertDocStringToPlainText(functionDocString),
+                    value: this._docStringService.convertDocStringToPlainText(functionDocString),
                 };
             }
         }

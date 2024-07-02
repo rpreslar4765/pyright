@@ -29,6 +29,7 @@ import { FunctionArgument, TypeEvaluator } from './typeEvaluatorTypes';
 import {
     computeMroLinearization,
     convertToInstance,
+    getTypeVarScopeId,
     isLiteralType,
     isTupleClass,
     isUnboundedTupleClass,
@@ -129,7 +130,7 @@ export function createNamedTupleType(
     classType.details.baseClasses.push(namedTupleType);
     classType.details.typeVarScopeId = ParseTreeUtils.getScopeIdForNode(errorNode);
 
-    const classFields = classType.details.fields;
+    const classFields = ClassType.getSymbolTable(classType);
     classFields.set(
         '__class__',
         Symbol.createWithType(SymbolFlags.ClassMember | SymbolFlags.IgnoredForProtocolMatch, classType)
@@ -138,6 +139,7 @@ export function createNamedTupleType(
     const classTypeVar = synthesizeTypeVarForSelfCls(classType, /* isClsParam */ true);
     const constructorType = FunctionType.createSynthesizedInstance('__new__', FunctionTypeFlags.ConstructorMethod);
     constructorType.details.declaredReturnType = convertToInstance(classTypeVar);
+    constructorType.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
     if (ParseTreeUtils.isAssignmentToDefaultsFollowingNamedTuple(errorNode)) {
         constructorType.details.flags |= FunctionTypeFlags.DisableDefaultChecks;
     }
@@ -376,18 +378,10 @@ export function createNamedTupleType(
     FunctionType.addParameter(initType, selfParameter);
     FunctionType.addDefaultParameters(initType);
     initType.details.declaredReturnType = evaluator.getNoneType();
+    initType.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
 
     classFields.set('__new__', Symbol.createWithType(SymbolFlags.ClassMember, constructorType));
     classFields.set('__init__', Symbol.createWithType(SymbolFlags.ClassMember, initType));
-
-    const keysItemType = FunctionType.createSynthesizedInstance('keys');
-    const itemsItemType = FunctionType.createSynthesizedInstance('items');
-    keysItemType.details.declaredReturnType = evaluator.getBuiltInObject(errorNode, 'list', [
-        evaluator.getBuiltInObject(errorNode, 'str'),
-    ]);
-    itemsItemType.details.declaredReturnType = keysItemType.details.declaredReturnType;
-    classFields.set('keys', Symbol.createWithType(SymbolFlags.InstanceMember, keysItemType));
-    classFields.set('items', Symbol.createWithType(SymbolFlags.InstanceMember, itemsItemType));
 
     const lenType = FunctionType.createSynthesizedInstance('__len__');
     lenType.details.declaredReturnType = evaluator.getBuiltInObject(errorNode, 'int');

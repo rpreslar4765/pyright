@@ -229,6 +229,7 @@ async function processArgs(): Promise<ExitStatus> {
     }
 
     const options = new PyrightCommandLineOptions(process.cwd(), false);
+    const tempFile = new RealTempFile();
 
     // Assume any relative paths are relative to the working directory.
     if (args.files && Array.isArray(args.files)) {
@@ -254,10 +255,10 @@ async function processArgs(): Promise<ExitStatus> {
         options.includeFileSpecsOverride = options.includeFileSpecsOverride.map((f) => combinePaths(process.cwd(), f));
 
         // Verify the specified file specs to make sure their wildcard roots exist.
-        const tempFileSystem = new PyrightFileSystem(createFromRealFileSystem());
+        const tempFileSystem = new PyrightFileSystem(createFromRealFileSystem(tempFile));
 
         for (const fileDesc of options.includeFileSpecsOverride) {
-            const includeSpec = getFileSpec(Uri.file(process.cwd(), tempFileSystem.isCaseSensitive), fileDesc);
+            const includeSpec = getFileSpec(Uri.file(process.cwd(), tempFile), fileDesc);
             try {
                 const stat = tryStat(tempFileSystem, includeSpec.wildcardRoot);
                 if (!stat) {
@@ -370,8 +371,10 @@ async function processArgs(): Promise<ExitStatus> {
     // If using outputjson, redirect all console output to stderr so it doesn't mess
     // up the JSON output, which goes to stdout.
     const output = args.outputjson ? new StderrConsole(logLevel) : new StandardConsole(logLevel);
-    const fileSystem = new PyrightFileSystem(createFromRealFileSystem(output, new ChokidarFileWatcherProvider(output)));
-    const tempFile = new RealTempFile(fileSystem.isCaseSensitive);
+    const fileSystem = new PyrightFileSystem(
+        createFromRealFileSystem(tempFile, output, new ChokidarFileWatcherProvider(output))
+    );
+
     const serviceProvider = createServiceProvider(fileSystem, output, tempFile);
 
     // The package type verification uses a different path.
@@ -435,7 +438,7 @@ async function processArgs(): Promise<ExitStatus> {
             }
         }
 
-        if (args.createstub && results.filesRequiringAnalysis === 0) {
+        if (args.createstub && results.requiringAnalysisCount.files === 0) {
             try {
                 service.writeTypeStub(cancellationNone);
                 service.dispose();
@@ -443,10 +446,10 @@ async function processArgs(): Promise<ExitStatus> {
             } catch (err) {
                 let errMessage = '';
                 if (err instanceof Error) {
-                    errMessage = ': ' + err.message;
+                    errMessage = err.message;
                 }
 
-                console.error(`Error occurred when creating type stub: ` + errMessage);
+                console.error(`Error occurred when creating type stub: ${errMessage}`);
                 exitStatus.resolve(ExitStatus.FatalError);
                 return;
             }
@@ -557,7 +560,7 @@ function buildTypeCompletenessReport(
 
     // Add the general diagnostics.
     completenessReport.generalDiagnostics.forEach((diag) => {
-        const jsonDiag = convertDiagnosticToJson(Uri.empty().getFilePath(), diag);
+        const jsonDiag = convertDiagnosticToJson('', diag);
         if (isDiagnosticIncluded(jsonDiag.severity, minSeverityLevel)) {
             report.generalDiagnostics.push(jsonDiag);
         }
@@ -841,6 +844,10 @@ function reportDiagnosticsAsJson(
     });
 
     console.info(JSON.stringify(report, /* replacer */ undefined, 4));
+
+    // Output a blank line to help tools that are attempting to parse the
+    // JSON output when used in watch mode.
+    console.info('');
 
     return {
         errorCount: report.summary.errorCount,

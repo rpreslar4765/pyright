@@ -47,6 +47,10 @@ import {
     CallNode,
     CaseNode,
     ClassNode,
+    ComprehensionForIfNode,
+    ComprehensionForNode,
+    ComprehensionIfNode,
+    ComprehensionNode,
     ConstantNode,
     ContinueNode,
     DecoratorNode,
@@ -72,10 +76,6 @@ import {
     ImportNode,
     IndexNode,
     LambdaNode,
-    ListComprehensionForIfNode,
-    ListComprehensionForNode,
-    ListComprehensionIfNode,
-    ListComprehensionNode,
     ListNode,
     MatchNode,
     MemberAccessNode,
@@ -146,7 +146,6 @@ import {
     StringTokenFlags,
     Token,
     TokenType,
-    softKeywords,
 } from './tokenizerTypes';
 
 interface ListResult<T> {
@@ -178,14 +177,18 @@ export class ParseOptions {
     }
 }
 
-export interface ParseResults {
-    text: string;
+export interface ParserOutput {
     parseTree: ModuleNode;
     importedModules: ModuleImport[];
     futureImports: Set<string>;
-    tokenizerOutput: TokenizerOutput;
     containsWildcardImport: boolean;
     typingSymbolAliases: Map<string, string>;
+}
+
+export interface ParseFileResults {
+    text: string;
+    parserOutput: ParserOutput;
+    tokenizerOutput: TokenizerOutput;
 }
 
 export interface ParseExpressionTextResults {
@@ -238,7 +241,7 @@ export class Parser {
     private _typingImportAliases: string[] = [];
     private _typingSymbolAliases: Map<string, string> = new Map<string, string>();
 
-    parseSourceFile(fileContents: string, parseOptions: ParseOptions, diagSink: DiagnosticSink): ParseResults {
+    parseSourceFile(fileContents: string, parseOptions: ParseOptions, diagSink: DiagnosticSink): ParseFileResults {
         timingStats.tokenizeFileTime.timeOperation(() => {
             this._startNewParse(fileContents, 0, fileContents.length, parseOptions, diagSink);
         });
@@ -275,12 +278,14 @@ export class Parser {
         assert(this._tokenizerOutput !== undefined);
         return {
             text: fileContents,
-            parseTree: moduleNode,
-            importedModules: this._importedModules,
-            futureImports: this._futureImports,
+            parserOutput: {
+                parseTree: moduleNode,
+                importedModules: this._importedModules,
+                futureImports: this._futureImports,
+                containsWildcardImport: this._containsWildcardImport,
+                typingSymbolAliases: this._typingSymbolAliases,
+            },
             tokenizerOutput: this._tokenizerOutput!,
-            containsWildcardImport: this._containsWildcardImport,
-            typingSymbolAliases: this._typingSymbolAliases,
         };
     }
 
@@ -490,7 +495,10 @@ export class Parser {
             this._getNextToken();
         }
 
+        const wasParsingTypeAnnotation = this._isParsingTypeAnnotation;
+        this._isParsingTypeAnnotation = true;
         const expression = this._parseTestExpression(/* allowAssignmentExpression */ false);
+        this._isParsingTypeAnnotation = wasParsingTypeAnnotation;
 
         return TypeAliasNode.create(typeToken, name, expression, typeParameters);
     }
@@ -1653,7 +1661,7 @@ export class Parser {
     }
 
     // comp_iter: comp_for | comp_if
-    private _tryParseListComprehension(target: ParseNode, isGenerator: boolean): ListComprehensionNode | undefined {
+    private _tryParseComprehension(target: ParseNode, isGenerator: boolean): ComprehensionNode | undefined {
         const compFor = this._tryParseCompForStatement();
 
         if (!compFor) {
@@ -1666,30 +1674,30 @@ export class Parser {
             this._addSyntaxError(LocMessage.dictExpandIllegalInComprehension(), target);
         }
 
-        const listCompNode = ListComprehensionNode.create(target, isGenerator);
+        const compNode = ComprehensionNode.create(target, isGenerator);
 
-        const forIfList: ListComprehensionForIfNode[] = [compFor];
+        const forIfList: ComprehensionForIfNode[] = [compFor];
         while (true) {
             const compIter = this._tryParseCompForStatement() || this._tryParseCompIfStatement();
             if (!compIter) {
                 break;
             }
-            compIter.parent = listCompNode;
+            compIter.parent = compNode;
             forIfList.push(compIter);
         }
 
-        listCompNode.forIfNodes = forIfList;
+        compNode.forIfNodes = forIfList;
         if (forIfList.length > 0) {
             forIfList.forEach((comp) => {
-                comp.parent = listCompNode;
+                comp.parent = compNode;
             });
-            extendRange(listCompNode, forIfList[forIfList.length - 1]);
+            extendRange(compNode, forIfList[forIfList.length - 1]);
         }
-        return listCompNode;
+        return compNode;
     }
 
     // comp_for: ['async'] 'for' exprlist 'in' or_test [comp_iter]
-    private _tryParseCompForStatement(): ListComprehensionForNode | undefined {
+    private _tryParseCompForStatement(): ComprehensionForNode | undefined {
         const startTokenKeywordType = this._peekKeywordType();
 
         if (startTokenKeywordType === KeywordType.Async) {
@@ -1723,7 +1731,7 @@ export class Parser {
             });
         }
 
-        const compForNode = ListComprehensionForNode.create(asyncToken || forToken, targetExpr, seqExpr!);
+        const compForNode = ComprehensionForNode.create(asyncToken || forToken, targetExpr, seqExpr!);
 
         if (asyncToken) {
             compForNode.isAsync = true;
@@ -1735,7 +1743,7 @@ export class Parser {
 
     // comp_if: 'if' test_nocond [comp_iter]
     // comp_iter: comp_for | comp_if
-    private _tryParseCompIfStatement(): ListComprehensionIfNode | undefined {
+    private _tryParseCompIfStatement(): ComprehensionIfNode | undefined {
         if (this._peekKeywordType() !== KeywordType.If) {
             return undefined;
         }
@@ -1745,7 +1753,7 @@ export class Parser {
             this._tryParseLambdaExpression() ||
             this._parseAssignmentExpression(/* disallowAssignmentExpression */ true);
 
-        const compIfNode = ListComprehensionIfNode.create(ifToken, ifExpr);
+        const compIfNode = ComprehensionIfNode.create(ifToken, ifExpr);
 
         return compIfNode;
     }
@@ -2958,7 +2966,10 @@ export class Parser {
                 const peekToken2 = this._peekToken(2);
                 let isInvalidTypeToken = true;
 
-                if (peekToken1.type === TokenType.Identifier || peekToken1.type === TokenType.Keyword) {
+                if (
+                    peekToken1.type === TokenType.Identifier ||
+                    (peekToken1.type === TokenType.Keyword && KeywordToken.isSoftKeyword(peekToken1 as KeywordToken))
+                ) {
                     if (peekToken2.type === TokenType.OpenBracket) {
                         isInvalidTypeToken = false;
                     } else if (
@@ -3173,7 +3184,7 @@ export class Parser {
 
         const rightExpr = this._parseTestExpression(/* allowAssignmentExpression */ false);
 
-        return AssignmentExpressionNode.create(leftExpr, rightExpr);
+        return AssignmentExpressionNode.create(leftExpr, walrusToken, rightExpr);
     }
 
     // or_test: and_test ('or' and_test)*
@@ -3485,7 +3496,7 @@ export class Parser {
 
                 if (argListResult.args.length > 1 || argListResult.trailingComma) {
                     argListResult.args.forEach((arg) => {
-                        if (arg.valueExpression.nodeType === ParseNodeType.ListComprehension) {
+                        if (arg.valueExpression.nodeType === ParseNodeType.Comprehension) {
                             if (!arg.valueExpression.isParenthesized) {
                                 this._addSyntaxError(LocMessage.generatorNotParenthesized(), arg.valueExpression);
                             }
@@ -3829,9 +3840,9 @@ export class Parser {
                     this._addSyntaxError(LocMessage.expectedParamName(), nameExpr);
                 }
             } else {
-                const listComp = this._tryParseListComprehension(valueExpr, /* isGenerator */ true);
-                if (listComp) {
-                    valueExpr = listComp;
+                const comprehension = this._tryParseComprehension(valueExpr, /* isGenerator */ true);
+                if (comprehension) {
+                    valueExpr = comprehension;
                 }
             }
         }
@@ -3899,11 +3910,11 @@ export class Parser {
                 possibleTupleNode.parenthesized = true;
             }
 
-            if (possibleTupleNode.nodeType === ParseNodeType.StringList) {
-                possibleTupleNode.isParenthesized = true;
-            }
-
-            if (possibleTupleNode.nodeType === ParseNodeType.ListComprehension) {
+            if (
+                possibleTupleNode.nodeType === ParseNodeType.StringList ||
+                possibleTupleNode.nodeType === ParseNodeType.Comprehension ||
+                possibleTupleNode.nodeType === ParseNodeType.AssignmentExpression
+            ) {
                 possibleTupleNode.isParenthesized = true;
             }
 
@@ -4083,9 +4094,9 @@ export class Parser {
         return this._parseExpressionListGeneric(
             () => {
                 let expr = this._parseTestOrStarExpression(/* allowAssignmentExpression */ true);
-                const listComp = this._tryParseListComprehension(expr, isGenerator);
-                if (listComp) {
-                    expr = listComp;
+                const comprehension = this._tryParseComprehension(expr, isGenerator);
+                if (comprehension) {
+                    expr = comprehension;
                     sawComprehension = true;
                 }
                 return expr;
@@ -4110,7 +4121,7 @@ export class Parser {
         const setEntries: ExpressionNode[] = [];
         let isDictionary = false;
         let isSet = false;
-        let sawListComprehension = false;
+        let sawComprehension = false;
         let isFirstEntry = true;
         let trailingCommaToken: Token | undefined;
 
@@ -4131,8 +4142,21 @@ export class Parser {
             } else {
                 keyExpression = this._parseTestOrStarExpression(/* allowAssignmentExpression */ true);
 
+                // Allow walrus operators in this context only for Python 3.10 and newer.
+                // Older versions of Python generated a syntax error in this context.
+                let isWalrusAllowed = this._getLanguageVersion().isGreaterOrEqualTo(pythonVersion3_10);
+
                 if (this._consumeTokenIfType(TokenType.Colon)) {
                     valueExpression = this._parseTestExpression(/* allowAssignmentExpression */ false);
+                    isWalrusAllowed = false;
+                }
+
+                if (
+                    !isWalrusAllowed &&
+                    keyExpression.nodeType === ParseNodeType.AssignmentExpression &&
+                    !keyExpression.isParenthesized
+                ) {
+                    this._addSyntaxError(LocMessage.walrusNotAllowed(), keyExpression.walrusToken);
                 }
             }
 
@@ -4146,10 +4170,10 @@ export class Parser {
                 } else {
                     const keyEntryNode = DictionaryKeyEntryNode.create(keyExpression, valueExpression);
                     let dictEntry: DictionaryEntryNode = keyEntryNode;
-                    const listComp = this._tryParseListComprehension(keyEntryNode, /* isGenerator */ false);
-                    if (listComp) {
-                        dictEntry = listComp;
-                        sawListComprehension = true;
+                    const comprehension = this._tryParseComprehension(keyEntryNode, /* isGenerator */ false);
+                    if (comprehension) {
+                        dictEntry = comprehension;
+                        sawComprehension = true;
 
                         if (!isFirstEntry) {
                             this._addSyntaxError(LocMessage.comprehensionInDict(), dictEntry);
@@ -4165,10 +4189,10 @@ export class Parser {
                     const listEntryNode = DictionaryExpandEntryNode.create(doubleStarExpression);
                     extendRange(listEntryNode, doubleStar);
                     let expandEntryNode: DictionaryEntryNode = listEntryNode;
-                    const listComp = this._tryParseListComprehension(listEntryNode, /* isGenerator */ false);
-                    if (listComp) {
-                        expandEntryNode = listComp;
-                        sawListComprehension = true;
+                    const comprehension = this._tryParseComprehension(listEntryNode, /* isGenerator */ false);
+                    if (comprehension) {
+                        expandEntryNode = comprehension;
+                        sawComprehension = true;
 
                         if (!isFirstEntry) {
                             this._addSyntaxError(LocMessage.comprehensionInDict(), doubleStarExpression);
@@ -4189,10 +4213,10 @@ export class Parser {
                         dictionaryEntries.push(keyEntryNode);
                         this._addSyntaxError(LocMessage.dictKeyValuePairs(), keyExpression);
                     } else {
-                        const listComp = this._tryParseListComprehension(keyExpression, /* isGenerator */ false);
-                        if (listComp) {
-                            keyExpression = listComp;
-                            sawListComprehension = true;
+                        const comprehension = this._tryParseComprehension(keyExpression, /* isGenerator */ false);
+                        if (comprehension) {
+                            keyExpression = comprehension;
+                            sawComprehension = true;
 
                             if (!isFirstEntry) {
                                 this._addSyntaxError(LocMessage.comprehensionInSet(), keyExpression);
@@ -4205,7 +4229,7 @@ export class Parser {
             }
 
             // List comprehension statements always end the list.
-            if (sawListComprehension) {
+            if (sawComprehension) {
                 break;
             }
 
@@ -4891,7 +4915,10 @@ export class Parser {
                     if (this._isParsingQuotedText) {
                         this._addSyntaxError(LocMessage.annotationStringEscape(), stringNode);
                     }
-                } else {
+                } else if (
+                    (stringToken.flags & (StringTokenFlags.Raw | StringTokenFlags.Bytes | StringTokenFlags.Format)) ===
+                    0
+                ) {
                     const parser = new Parser();
                     const parseResults = parser.parseTextExpression(
                         this._fileContents!,
@@ -5075,8 +5102,8 @@ export class Parser {
 
         // If this is a "soft keyword", it can be converted into an identifier.
         if (nextToken.type === TokenType.Keyword) {
-            const keywordType = this._peekKeywordType();
-            if (softKeywords.find((type) => type === keywordType)) {
+            const keywordToken = nextToken as KeywordToken;
+            if (KeywordToken.isSoftKeyword(keywordToken)) {
                 const keywordText = this._fileContents!.substr(nextToken.start, nextToken.length);
                 this._getNextToken();
                 return IdentifierToken.create(nextToken.start, nextToken.length, keywordText, nextToken.comments);

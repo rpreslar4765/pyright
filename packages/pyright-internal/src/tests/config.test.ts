@@ -12,21 +12,23 @@ import assert from 'assert';
 import { AnalyzerService } from '../analyzer/service';
 import { deserialize, serialize } from '../backgroundThreadBase';
 import { CommandLineOptions } from '../common/commandLineOptions';
-import { ConfigOptions, ExecutionEnvironment } from '../common/configOptions';
+import { ConfigOptions, ExecutionEnvironment, getStandardDiagnosticRuleSet } from '../common/configOptions';
 import { ConsoleInterface, NullConsole } from '../common/console';
 import { NoAccessHost } from '../common/host';
 import { combinePaths, normalizePath, normalizeSlashes } from '../common/pathUtils';
 import { pythonVersion3_9 } from '../common/pythonVersion';
-import { createFromRealFileSystem } from '../common/realFileSystem';
+import { RealTempFile, createFromRealFileSystem } from '../common/realFileSystem';
 import { createServiceProvider } from '../common/serviceProviderExtensions';
 import { Uri } from '../common/uri/uri';
+import { UriEx } from '../common/uri/uriUtils';
 import { TestAccessHost } from './harness/testAccessHost';
 import { TestFileSystem } from './harness/vfs/filesystem';
 
 function createAnalyzer(console?: ConsoleInterface) {
+    const tempFile = new RealTempFile();
     const cons = console ?? new NullConsole();
-    const fs = createFromRealFileSystem(cons);
-    const serviceProvider = createServiceProvider(fs, cons);
+    const fs = createFromRealFileSystem(tempFile, cons);
+    const serviceProvider = createServiceProvider(fs, cons, tempFile);
     return new AnalyzerService('<default>', serviceProvider, { console: cons });
 }
 
@@ -43,7 +45,8 @@ test('FindFilesWithConfigFile', () => {
     assert.strictEqual(configOptions.include.length, 1, `failed creating options from ${cwd}`);
     assert.strictEqual(
         configOptions.projectRoot.key,
-        service.fs.realCasePath(Uri.file(combinePaths(cwd, commandLineOptions.configFilePath))).key
+        service.fs.realCasePath(Uri.file(combinePaths(cwd, commandLineOptions.configFilePath), service.serviceProvider))
+            .key
     );
 
     const fileList = service.test_getFileNamesFromFileSpecs();
@@ -134,7 +137,9 @@ test('SomeFileSpecsAreInvalid', () => {
     assert.strictEqual(configOptions.exclude.length, 1);
     assert.strictEqual(
         configOptions.projectRoot.getFilePath(),
-        service.fs.realCasePath(Uri.file(combinePaths(cwd, commandLineOptions.configFilePath))).getFilePath()
+        service.fs
+            .realCasePath(Uri.file(combinePaths(cwd, commandLineOptions.configFilePath), service.serviceProvider))
+            .getFilePath()
     );
 
     const fileList = service.test_getFileNamesFromFileSpecs();
@@ -158,13 +163,14 @@ test('ConfigBadJson', () => {
 });
 
 test('FindExecEnv1', () => {
-    const cwd = Uri.file(normalizePath(process.cwd()));
+    const cwd = UriEx.file(normalizePath(process.cwd()));
     const configOptions = new ConfigOptions(cwd);
 
     // Build a config option with three execution environments.
     const execEnv1 = new ExecutionEnvironment(
         'python',
         cwd.resolvePaths('src/foo'),
+        getStandardDiagnosticRuleSet(),
         /* defaultPythonVersion */ undefined,
         /* defaultPythonPlatform */ undefined,
         /* defaultExtraPaths */ undefined
@@ -173,6 +179,7 @@ test('FindExecEnv1', () => {
     const execEnv2 = new ExecutionEnvironment(
         'python',
         cwd.resolvePaths('src'),
+        getStandardDiagnosticRuleSet(),
         /* defaultPythonVersion */ undefined,
         /* defaultPythonPlatform */ undefined,
         /* defaultExtraPaths */ undefined
@@ -186,15 +193,15 @@ test('FindExecEnv1', () => {
 
     // If none of the execution environments matched, we should get
     // a default environment with the root equal to that of the config.
-    const file4 = Uri.file('/nothing/bar.py');
+    const file4 = UriEx.file('/nothing/bar.py');
     const defaultExecEnv = configOptions.findExecEnvironment(file4);
     assert(defaultExecEnv.root);
-    const rootFilePath = Uri.isUri(defaultExecEnv.root) ? defaultExecEnv.root.getFilePath() : defaultExecEnv.root;
+    const rootFilePath = Uri.is(defaultExecEnv.root) ? defaultExecEnv.root.getFilePath() : defaultExecEnv.root;
     assert.strictEqual(normalizeSlashes(rootFilePath), normalizeSlashes(configOptions.projectRoot.getFilePath()));
 });
 
 test('PythonPlatform', () => {
-    const cwd = Uri.file(normalizePath(process.cwd()));
+    const cwd = UriEx.file(normalizePath(process.cwd()));
 
     const configOptions = new ConfigOptions(cwd);
 
@@ -211,16 +218,19 @@ test('PythonPlatform', () => {
     const nullConsole = new NullConsole();
 
     const sp = createServiceProvider(fs, nullConsole);
-    configOptions.initializeFromJson(json, undefined, sp, new NoAccessHost());
+    configOptions.initializeFromJson(json, cwd, sp, new NoAccessHost());
 
     const env = configOptions.executionEnvironments[0];
     assert.strictEqual(env.pythonPlatform, 'platform');
 });
 
 test('AutoSearchPathsOn', () => {
-    const cwd = Uri.file(normalizePath(combinePaths(process.cwd(), 'src/tests/samples/project_src')));
     const nullConsole = new NullConsole();
     const service = createAnalyzer(nullConsole);
+    const cwd = Uri.file(
+        normalizePath(combinePaths(process.cwd(), 'src/tests/samples/project_src')),
+        service.serviceProvider
+    );
     const commandLineOptions = new CommandLineOptions(cwd.getFilePath(), /* fromVsCodeExtension */ false);
     commandLineOptions.autoSearchPaths = true;
     service.setOptions(commandLineOptions);
@@ -280,7 +290,7 @@ test('AutoSearchPathsOnAndExtraPaths', () => {
     const service = createAnalyzer(nullConsole);
     const cwd = Uri.file(
         normalizePath(combinePaths(process.cwd(), 'src/tests/samples/project_src_with_config_no_extra_paths')),
-        service.fs.isCaseSensitive
+        service.serviceProvider
     );
     const commandLineOptions = new CommandLineOptions(cwd.getFilePath(), /* fromVsCodeExtension */ false);
     commandLineOptions.autoSearchPaths = true;
@@ -313,13 +323,13 @@ test('BasicPyprojectTomlParsing', () => {
 test('FindFilesInMemoryOnly', () => {
     const cwd = normalizePath(process.cwd());
     const service = createAnalyzer();
-    const commandLineOptions = new CommandLineOptions('', /* fromVsCodeExtension */ true);
+    const commandLineOptions = new CommandLineOptions(undefined, /* fromVsCodeExtension */ true);
     // Force a lookup of the typeshed path. This causes us to try and generate a module path for the untitled file.
     commandLineOptions.typeshedPath = combinePaths(cwd, 'src', 'tests', 'samples');
     service.setOptions(commandLineOptions);
 
     // Open a file that is not backed by the file system.
-    const untitled = Uri.parse('untitled:Untitled-1.py', true);
+    const untitled = Uri.parse('untitled:Untitled-1.py', service.serviceProvider);
     service.setFileOpened(untitled, 1, '# empty');
 
     const fileList = service.test_getFileNamesFromFileSpecs();
@@ -332,18 +342,50 @@ test('verify config fileSpecs after cloning', () => {
         ignore: ['**/node_modules/**'],
     };
 
-    const config = new ConfigOptions(Uri.file(process.cwd()));
+    const rootUri = Uri.file(process.cwd(), fs);
+    const config = new ConfigOptions(rootUri);
     const sp = createServiceProvider(fs, new NullConsole());
-    config.initializeFromJson(configFile, undefined, sp, new TestAccessHost());
+    config.initializeFromJson(configFile, rootUri, sp, new TestAccessHost());
     const cloned = deserialize(serialize(config));
 
     assert.deepEqual(config.ignore, cloned.ignore);
 });
 
 test('verify can serialize config options', () => {
-    const config = new ConfigOptions(Uri.file(process.cwd()));
+    const config = new ConfigOptions(UriEx.file(process.cwd()));
     const serialized = serialize(config);
     const deserialized = deserialize<ConfigOptions>(serialized);
     assert.deepEqual(config, deserialized);
-    assert.ok(deserialized.findExecEnvironment(Uri.file('foo/bar.py')));
+    assert.ok(deserialized.findExecEnvironment(UriEx.file('foo/bar.py')));
+});
+
+test('extra paths on undefined execution root/default workspace', () => {
+    const nullConsole = new NullConsole();
+    const service = createAnalyzer(nullConsole);
+    const commandLineOptions = new CommandLineOptions(undefined, /* fromVsCodeExtension */ false);
+    commandLineOptions.extraPaths = ['/extraPaths'];
+
+    service.setOptions(commandLineOptions);
+    const configOptions = service.test_getConfigOptions(commandLineOptions);
+
+    const expectedExtraPaths = [Uri.file('/extraPaths', service.serviceProvider)];
+    assert.deepStrictEqual(
+        configOptions.defaultExtraPaths?.map((u) => u.getFilePath()),
+        expectedExtraPaths.map((u) => u.getFilePath())
+    );
+});
+
+test('Extended config files', () => {
+    const cwd = normalizePath(combinePaths(process.cwd(), 'src/tests/samples/project_with_extended_config'));
+    const service = createAnalyzer();
+    const commandLineOptions = new CommandLineOptions(cwd, /* fromVsCodeExtension */ true);
+
+    service.setOptions(commandLineOptions);
+
+    const fileList = service.test_getFileNamesFromFileSpecs();
+    const fileNames = fileList.map((p) => p.fileName).sort();
+    assert.deepStrictEqual(fileNames, ['sample.pyi', 'test.py']);
+
+    const configOptions = service.test_getConfigOptions(commandLineOptions);
+    assert.equal(configOptions.diagnosticRuleSet.strictListInference, true);
 });

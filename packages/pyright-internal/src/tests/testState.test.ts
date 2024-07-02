@@ -45,7 +45,11 @@ test('Multiple files', () => {
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/'));
-    assert(state.fs.existsSync(Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')), state.serviceProvider)
+        )
+    );
 });
 
 test('Configuration', () => {
@@ -115,7 +119,11 @@ test('Configuration', () => {
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/'));
-    assert(state.fs.existsSync(Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')), state.serviceProvider)
+        )
+    );
 
     assert.equal(state.configOptions.diagnosticRuleSet.reportMissingImports, 'error');
     assert.equal(state.configOptions.diagnosticRuleSet.reportMissingModuleSource, 'warning');
@@ -160,7 +168,7 @@ test('ProjectRoot', () => {
     const state = parseAndGetTestState(code).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/root'));
-    assert(state.fs.existsSync(Uri.file(normalizeSlashes('/root/file1.py'))));
+    assert(state.fs.existsSync(Uri.file(normalizeSlashes('/root/file1.py'), state.serviceProvider)));
 
     assert.equal(state.configOptions.projectRoot.getFilePath(), normalizeSlashes('/root'));
 });
@@ -193,7 +201,11 @@ test('IgnoreCase', () => {
 
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
-    assert(state.fs.existsSync(Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'FILE1.py')))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'FILE1.py')), state.serviceProvider)
+        )
+    );
 });
 
 test('GoToMarker', () => {
